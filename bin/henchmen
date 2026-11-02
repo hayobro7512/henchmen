@@ -1,0 +1,8 @@
+#!/usr/bin/env node
+try {
+  await import('node:sqlite');
+} catch {
+  console.error(`Henchmen needs Node 22.13 or newer (you have ${process.version}). Update Node, then run this again.`);
+  process.exit(1);
+}
+await import('../src/cli.mjs');

@@ -1,0 +1,17 @@
+{
+  "name": "henchmen",
+  "owner": {
+    "name": "hayobro7512",
+    "url": "https://github.com/hayobro7512"
+  },
+  "metadata": {
+    "description": "Henchmen: run a crew of agents on one large project from one local page."
+  },
+  "plugins": [
+    {
+      "name": "henchmen",
+      "source": "./",
+      "description": "Run a crew of agents on one large project from one local page."
+    }
+  ]
+}

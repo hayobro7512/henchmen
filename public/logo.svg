@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256">
+  <defs>
+    <g id="bowler">
+      <path d="M20 66C16 20 38 0 60 0s44 20 40 66q-40 8-80 0z"/>
+      <path d="M0 62c20 16 100 16 120 0 4 24-24 38-60 38S-4 86 0 62z"/>
+    </g>
+  </defs>
+  <use href="#bowler" x="68" y="14" fill="#B8820A"/>
+  <use href="#bowler" x="4" y="136" fill="#3F68A8"/>
+  <use href="#bowler" x="132" y="136" fill="#3F68A8"/>
+</svg>
