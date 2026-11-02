@@ -70,6 +70,10 @@ Set per room in Room settings. This applies to agents started from the page.
 
 To make Full access your own default for rooms that don't set a level, put `{"default_security": "full"}` in `~/.henchmen/config.json` and restart the server. The page labels any room running at Full access.
 
+## How long it runs
+
+A room keeps going until its leader says the goal is done, or the stop time you set in **Room settings** passes. Either way the agents are told to wrap up, and **Keep going** on the page restarts them. If everyone stops early, the leader is reminded twice, then the chat says so.
+
 ## Spending
 
 Agents in terminal windows use your Claude plan's usage, so they have no spending cap, and room budgets don't limit them. Background agents need a spending cap, and one whose cap doesn't fit its room's budget won't start. If agents keep waking each other with no input from you, the room pauses until you resume it (30 wake-ups by default).

@@ -31,6 +31,7 @@ henchmen ROOM ME report set SECTION [--base V] [text, or stdin]   exit 1 with ST
 henchmen ROOM ME detail [NAME] [text, or stdin]   no text reads the page, no NAME lists pages
 henchmen ROOM ME take ID      take a message from the human that nobody has yet; the first to take it has it
 henchmen ROOM ME resolve ID   close your own blocker, question or taken message (leader: anyone's)
+henchmen ROOM ME goal done WHY  leader only: the goal is met and checked, so the room stops until the human restarts it
 henchmen ROOM ME leave        leave and release your claims here
 henchmen ROOM ME log [n]
 henchmen ROOM ME show ID
@@ -219,7 +220,10 @@ async function main(argv) {
     args.role = rest.shift();
     args.body = rest.join(' ');
   } else if (cmd === 'doing' || cmd === 'claim' || cmd === 'release' || cmd === 'rename') args.body = rest.join(' ');
-  else if (cmd === 'wait') args.secs = rest[0];
+  else if (cmd === 'goal') {
+    if (rest.shift() !== 'done') { console.error(`usage: henchmen ROOM ME goal done WHY`); process.exit(2); }
+    args.body = rest.join(' ');
+  } else if (cmd === 'wait') args.secs = rest[0];
   else if (cmd === 'log') args.n = rest[0];
   else if (cmd === 'show' || cmd === 'resolve' || cmd === 'take') args.id = rest[0];
   else if (cmd === 'task') {

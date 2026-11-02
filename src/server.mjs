@@ -90,7 +90,7 @@ export function serve() {
   writeFileSync(lockPath, JSON.stringify({ pid: process.pid, port: PORT }), { mode: 0o600 });
   const db = new DatabaseSync(dbPath);
   db.exec(`PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;
-    CREATE TABLE IF NOT EXISTS rooms(id INTEGER PRIMARY KEY AUTOINCREMENT, parent_id INTEGER REFERENCES rooms(id) ON DELETE CASCADE, slug TEXT NOT NULL, brief TEXT DEFAULT '', dir TEXT, instructions TEXT, security TEXT, budget_usd REAL, wake_limit INTEGER DEFAULT 30, wakes INTEGER DEFAULT 0, paused INTEGER DEFAULT 0, leader TEXT, created INTEGER, UNIQUE(parent_id, slug));
+    CREATE TABLE IF NOT EXISTS rooms(id INTEGER PRIMARY KEY AUTOINCREMENT, parent_id INTEGER REFERENCES rooms(id) ON DELETE CASCADE, slug TEXT NOT NULL, brief TEXT DEFAULT '', dir TEXT, instructions TEXT, security TEXT, budget_usd REAL, wake_limit INTEGER DEFAULT 0, wakes INTEGER DEFAULT 0, paused INTEGER DEFAULT 0, leader TEXT, created INTEGER, UNIQUE(parent_id, slug));
     CREATE UNIQUE INDEX IF NOT EXISTS root_slug ON rooms(slug) WHERE parent_id IS NULL;
     CREATE TABLE IF NOT EXISTS messages(id INTEGER PRIMARY KEY AUTOINCREMENT, room_id INTEGER NOT NULL REFERENCES rooms(id) ON DELETE CASCADE, sender TEXT, target TEXT, kind TEXT, body TEXT, ts INTEGER, from_room TEXT, source_id INTEGER, open INTEGER DEFAULT 0);
     CREATE INDEX IF NOT EXISTS msg_room ON messages(room_id, id);
@@ -106,7 +106,9 @@ export function serve() {
     CREATE TABLE IF NOT EXISTS events(id INTEGER PRIMARY KEY AUTOINCREMENT, room_id INTEGER, actor TEXT, what TEXT, ts INTEGER);
     UPDATE approvals SET status='expired' WHERE status='pending';`);
 
-  for (const col of ['messages ADD COLUMN taken_by TEXT', 'messages ADD COLUMN handled INTEGER', 'runs ADD COLUMN role TEXT', 'runs ADD COLUMN session_name TEXT', 'agents ADD COLUMN cleared INTEGER DEFAULT 0', 'runs ADD COLUMN mode TEXT DEFAULT \'background\'', 'runs ADD COLUMN tty TEXT', 'runs ADD COLUMN pid INTEGER', 'runs ADD COLUMN effort TEXT', 'runs ADD COLUMN session TEXT', 'runs ADD COLUMN acked INTEGER DEFAULT 0', 'rooms ADD COLUMN instructions_version INTEGER DEFAULT 0']) try { db.exec(`ALTER TABLE ${col}`); } catch { /* already there */ }
+  const oldRooms = !db.prepare(`SELECT 1 x FROM pragma_table_info('rooms') WHERE name='until_ts'`).get();
+  for (const col of ['rooms ADD COLUMN until_ts INTEGER', 'rooms ADD COLUMN pause_why TEXT', 'messages ADD COLUMN taken_by TEXT', 'messages ADD COLUMN handled INTEGER', 'runs ADD COLUMN role TEXT', 'runs ADD COLUMN session_name TEXT', 'agents ADD COLUMN cleared INTEGER DEFAULT 0', 'runs ADD COLUMN mode TEXT DEFAULT \'background\'', 'runs ADD COLUMN tty TEXT', 'runs ADD COLUMN pid INTEGER', 'runs ADD COLUMN effort TEXT', 'runs ADD COLUMN session TEXT', 'runs ADD COLUMN acked INTEGER DEFAULT 0', 'rooms ADD COLUMN instructions_version INTEGER DEFAULT 0']) try { db.exec(`ALTER TABLE ${col}`); } catch { /* already there */ }
+  if (oldRooms) db.exec(`UPDATE rooms SET wake_limit=0 WHERE wake_limit=30`); // 30 was the old automatic pause; a room now runs until its goal or stop time
   // Background agents die with the server. Window agents live in Terminal and get picked back up below.
   db.exec(`UPDATE runs SET status='crashed', why='The server restarted while this agent ran', ended=${Date.now()} WHERE COALESCE(mode,'background')<>'window' AND status IN ('running','idle','waiting','terminal')`);
   const q = (sql, ...a) => db.prepare(sql).all(...a);
@@ -159,7 +161,7 @@ export function serve() {
     const slug = parts.pop();
     const parent = parts.length ? resolvePath(parts.join('/')) : null;
     if (resolvePath(path, false)) throw new Refuse(409, `room ${path} already exists`);
-    const id = Number(run(`INSERT INTO rooms(parent_id, slug, brief, dir, created) VALUES(?,?,?,?,?)`, parent?.id ?? null, slug, scrub(brief).trim(), dir || null, Date.now()).lastInsertRowid);
+    const id = Number(run(`INSERT INTO rooms(wake_limit, parent_id, slug, brief, dir, created) VALUES(0, ?,?,?,?,?)`, parent?.id ?? null, slug, scrub(brief).trim(), dir || null, Date.now()).lastInsertRowid);
     return room(id);
   }
 
@@ -261,10 +263,18 @@ export function serve() {
     if (fromHuman || !woke.size) return;
     const wakes = fresh.wakes + woke.size;
     run(`UPDATE rooms SET wakes=? WHERE id=?`, wakes, r.id);
-    if (wakes >= fresh.wake_limit && !fresh.paused) {
+    if (fresh.wake_limit && wakes >= fresh.wake_limit && !fresh.paused) {
       run(`UPDATE rooms SET paused=1 WHERE id=?`, r.id);
       insert(r, 'system', null, 'note', `Paused after ${wakes} wake-up${wakes === 1 ? '' : 's'} with no input from you, so agents can't keep spending by talking in a loop. Resume from the page.`);
     }
+  }
+  // Tells the agents first, so they can wrap up, then stops them waking each other.
+  function stopRoom(r, forHuman, forAgents) {
+    insert(r, 'system', 'all', 'note', `${forAgents} Finish what you're doing and update the report. Start nothing new; your user restarts this room if there's more.`);
+    run(`UPDATE rooms SET paused=1, pause_why=?, until_ts=NULL WHERE id=?`, forHuman, r.id);
+  }
+  function checkStopTimes() {
+    for (const r of q(`SELECT * FROM rooms WHERE until_ts<=? AND paused=0`, Date.now())) stopRoom(r, 'The stop time you set has passed.', 'The stop time your user set has passed.');
   }
   function drain(r, name) {
     const a = one(`SELECT * FROM agents WHERE room_id=? AND name=?`, r.id, name);
@@ -331,7 +341,7 @@ export function serve() {
       for (const a of q(`SELECT * FROM agent_requests WHERE room_id=? AND status='pending'`, id)) list.push({ ...base, type: 'request', id: a.id, agent: a.by, role: a.role, model: a.model, body: a.why, ts: a.ts });
       for (const u of q(`SELECT * FROM runs WHERE room_id=? AND mode='window' AND status='waiting'`, id)) list.push({ ...base, type: 'window', id: u.id, agent: u.agent, body: u.activity || 'Waiting for you in its terminal', ts: u.started });
       for (const u of q(`SELECT * FROM runs WHERE room_id=? AND status IN ('crashed','capped') AND acked=0`, id)) list.push({ ...base, type: 'agent', id: u.id, agent: u.agent, status: u.status, body: u.why, ts: u.ended ?? u.started });
-      if (x.paused) list.push({ ...base, type: 'paused', id, body: `Agents here stopped waking each other after ${x.wakes} wake-up${x.wakes === 1 ? '' : 's'}. Resume to let them continue.`, ts: x.created });
+      if (x.paused) list.push({ ...base, type: 'paused', id, body: x.pause_why || `Agents here stopped waking each other after ${x.wakes} wake-up${x.wakes === 1 ? '' : 's'}. Resume to let them continue.`, ts: x.created });
     }
     return list.sort((a, b) => a.ts - b.ts);
   }
@@ -885,13 +895,15 @@ export function serve() {
         const leader = room(r.id).leader;
         const idle = [...procs.values()].filter((p) => p.roomId === r.id && p.agent !== leader).map((p) => p.agent);
         const p = leader && liveRun(r.id, leader);
-        if (open.length && p && !room(r.id).paused) {
+        if (p && !room(r.id).paused) {
           const sig = open.map(taskLine).join('|');
           const last = state.seen.get(r.id);
           const n = last?.sig === sig ? last.n + 1 : 1;
           state.seen.set(r.id, { sig, n });
           // Told twice with nothing changed: it's stuck, and the page shows that.
-          if (n <= 2) writeTurn(p, `From the room: Nobody in this project is working right now, and these tasks are open: ${open.map(taskLine).join('; ')}. You lead this room: close finished ones with task status ID done.${idle.length ? ` ${idle.join(', ')} ${idle.length === 1 ? 'is' : 'are'} here and idle, not gone: @name wakes them.` : ''} Post blocked only if nothing here can move it.`);
+          if (n === 3) insert(r, 'system', null, 'note', "Everyone has stopped and the goal isn't marked done. Send a message to get them going.");
+          if (n <= 2 && !open.length) writeTurn(p, `From the room: Nobody in this project is working right now and no tasks are open, but the goal isn't marked done. Make tasks and carry on. If the goal is truly met and checked, run goal done WHY. If only your user can move it, post ask @human.`);
+          if (n <= 2 && open.length) writeTurn(p, `From the room: Nobody in this project is working right now, and these tasks are open: ${open.map(taskLine).join('; ')}. You lead this room: close finished ones with task status ID done.${idle.length ? ` ${idle.join(', ')} ${idle.length === 1 ? 'is' : 'are'} here and idle, not gone: @name wakes them.` : ''} Post blocked only if nothing here can move it.`);
         }
         // Agents who never said done may have been waiting on work that has landed since.
         for (const q2 of [...procs.values()].filter((x) => x.roomId === r.id && !room(r.id).paused)) {
@@ -967,7 +979,7 @@ export function serve() {
       }
     }
   }
-  setInterval(() => { try { dispatch(); } catch (e) { console.error(e); } }, 1000).unref();
+  setInterval(() => { try { checkStopTimes(); dispatch(); } catch (e) { console.error(e); } }, 1000).unref();
 
   // ---------- agent commands (the CLI) ----------
   const commands = {
@@ -1153,6 +1165,15 @@ export function serve() {
       if (!c.changes) throw new Refuse(404, `#${id} isn't an open item you can resolve here`);
       return `#${id} resolved`;
     },
+    goal(r, a, { body }) {
+      const why = String(body ?? '').trim();
+      const leader = room(r.id).leader;
+      if (leader !== a.name) throw new Refuse(403, `Only the leader, ${leader}, can say the goal is done. Tell them with @${leader}.`);
+      if (!why) throw new Refuse(400, 'Say what shows the goal is done: goal done WHY');
+      stopRoom(r, `Goal done, says ${a.name}: ${why}`, `${a.name} says the goal is done: ${why}`);
+      if (r.parent_id) { const up = room(r.parent_id); insert(up, 'system', up.leader || null, 'note', `The ${r.slug} division says its goal is done: ${why}`); }
+      return 'goal done; the room has stopped until your user restarts it';
+    },
     leave(r, a) {
       markLeft(r, a.name, true);
       return 'left the room; your claims are released';
@@ -1222,7 +1243,7 @@ export function serve() {
     return {
       windows_available: windowsAvailable(),
       default_mode: config.default_mode || (windowsAvailable() ? 'window' : 'background'),
-      room: { id: r.id, slug: r.slug, path: pathOf(r), parent_id: r.parent_id, brief: r.brief, dir: r.dir, effective_dir: dirOf(r), instructions: r.instructions, instructions_version: r.instructions_version, effective_instructions: instructionsOf(r), security: r.security, effective_security: securityOf(r), budget_usd: r.budget_usd, wake_limit: r.wake_limit, wakes: r.wakes, paused: !!r.paused },
+      room: { id: r.id, slug: r.slug, path: pathOf(r), parent_id: r.parent_id, brief: r.brief, dir: r.dir, effective_dir: dirOf(r), instructions: r.instructions, instructions_version: r.instructions_version, effective_instructions: instructionsOf(r), security: r.security, effective_security: securityOf(r), budget_usd: r.budget_usd, wake_limit: r.wake_limit, until_ts: r.until_ts, wakes: r.wakes, paused: !!r.paused },
       crumbs: [...ancestors(r).reverse(), r].map((x) => ({ id: x.id, slug: x.slug })),
       leader,
       word_limit: wordLimit(r),
@@ -1351,7 +1372,7 @@ export function serve() {
       run(`DELETE FROM rooms WHERE id=?`, r.id);
       return { ok: true, parent_id: r.parent_id };
     },
-    settings({ id, brief, dir, instructions, instructions_base, security, budget_usd, wake_limit }) {
+    settings({ id, brief, dir, instructions, instructions_base, security, budget_usd, wake_limit, until_ts }) {
       const r = need(id);
       if (brief !== undefined) run(`UPDATE rooms SET brief=? WHERE id=?`, scrub(capped(brief, MAX_BRIEF, 'goal')).trim(), r.id);
       if (dir !== undefined) {
@@ -1373,8 +1394,12 @@ export function serve() {
         if (budget_usd !== null && !(Number(budget_usd) > 0)) throw new Refuse(400, 'budget must be above 0, or empty for none');
         run(`UPDATE rooms SET budget_usd=? WHERE id=?`, budget_usd === null ? null : Number(budget_usd), r.id);
       }
+      if (until_ts !== undefined) {
+        if (until_ts !== null && !(Number(until_ts) > Date.now())) throw new Refuse(400, 'Pick a stop time in the future');
+        run(`UPDATE rooms SET until_ts=? WHERE id=?`, until_ts === null ? null : Number(until_ts), r.id);
+      }
       if (wake_limit !== undefined) {
-        if (!(Number(wake_limit) >= 1)) throw new Refuse(400, 'wake limit must be at least 1');
+        if (!(Number(wake_limit) >= 0)) throw new Refuse(400, "wake limit can't be negative");
         run(`UPDATE rooms SET wake_limit=? WHERE id=?`, Math.floor(Number(wake_limit)), r.id);
       }
       return { ok: true };
@@ -1447,7 +1472,7 @@ export function serve() {
     },
     resume({ id }) {
       const r = need(id);
-      run(`UPDATE rooms SET paused=0, wakes=0 WHERE id=?`, r.id);
+      run(`UPDATE rooms SET paused=0, wakes=0, pause_why=NULL WHERE id=?`, r.id);
       insert(r, 'system', null, 'note', 'Resumed.');
       for (const w of [...waiters]) if (w.roomId === r.id && hasAddressedUnread(r, w.agent)) w.deliver();
       for (const p of procs.values()) if (p.roomId === r.id) for (const m of p.held?.splice(0) ?? []) deliverToAgent(p, m);

@@ -23,7 +23,7 @@ If you're alone in the room with nothing pending, finish normally. When your wor
 
 - On a message: handle it, then wait again.
 - On `quiet`: stop waiting and tell the user you're idle.
-- If the room is paused for too many wake-ups, tell the user; only they can resume it.
+- If the room is paused, tell the user; only they can resume it.
 
 ## Report
 

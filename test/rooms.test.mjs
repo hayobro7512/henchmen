@@ -392,6 +392,30 @@ test('a message sent before the wait wakes it at once; a second wait replaces th
   assert.match(await until(3000, two), /hello/);
 });
 
+test('a room runs until the leader says the goal is done or the stop time passes', async () => {
+  br(['new', 'goalrun']);
+  const id = roomId('goalrun');
+  br(['goalrun', 'a', 'sync']); br(['goalrun', 'b', 'sync']);
+  assert.equal((await view('goalrun')).room.wake_limit, 0);
+  assert.notEqual(br(['goalrun', 'b', 'goal', 'done', 'all of it']).code, 0); // only the leader
+  assert.notEqual(br(['goalrun', 'a', 'goal', 'done']).code, 0); // it has to say why
+  assert.equal((await view('goalrun')).room.paused, false);
+  assert.equal(br(['goalrun', 'a', 'goal', 'done', 'all 14 baskets pass']).code, 0);
+  let v = await view('goalrun');
+  assert.ok(v.room.paused);
+  assert.match(v.needs.find((n) => n.type === 'paused').body, /all 14 baskets pass/);
+  assert.ok(v.messages.some((m) => m.target === 'all' && /says the goal is done/.test(m.body)));
+  await page('resume', { id });
+  v = await view('goalrun');
+  assert.ok(!v.room.paused && !v.needs.some((n) => n.type === 'paused'));
+  assert.equal((await page('settings', { id, until_ts: 1 })).status, 400); // not in the past
+  await page('settings', { id, until_ts: Date.now() + 1200 });
+  assert.ok((await view('goalrun')).room.until_ts);
+  v = await until2(async () => { const x = await view('goalrun'); return x.room.paused && x; });
+  assert.match(v.needs.find((n) => n.type === 'paused').body, /stop time/);
+  assert.equal(v.room.until_ts, null);
+});
+
 test('the server pauses waking at the limit until the human resumes', async () => {
   br(['new', 'loop']);
   const id = roomId('loop');
