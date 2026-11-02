@@ -107,7 +107,7 @@ export function serve() {
     UPDATE approvals SET status='expired' WHERE status='pending';`);
 
   const oldRooms = !db.prepare(`SELECT 1 x FROM pragma_table_info('rooms') WHERE name='until_ts'`).get();
-  for (const col of ['rooms ADD COLUMN until_ts INTEGER', 'rooms ADD COLUMN pause_why TEXT', 'messages ADD COLUMN taken_by TEXT', 'messages ADD COLUMN handled INTEGER', 'runs ADD COLUMN role TEXT', 'runs ADD COLUMN session_name TEXT', 'agents ADD COLUMN cleared INTEGER DEFAULT 0', 'runs ADD COLUMN mode TEXT DEFAULT \'background\'', 'runs ADD COLUMN tty TEXT', 'runs ADD COLUMN pid INTEGER', 'runs ADD COLUMN effort TEXT', 'runs ADD COLUMN session TEXT', 'runs ADD COLUMN acked INTEGER DEFAULT 0', 'rooms ADD COLUMN instructions_version INTEGER DEFAULT 0']) try { db.exec(`ALTER TABLE ${col}`); } catch { /* already there */ }
+  for (const col of ['rooms ADD COLUMN until_ts INTEGER', 'rooms ADD COLUMN pause_why TEXT', 'rooms ADD COLUMN past_goal INTEGER DEFAULT 1', 'rooms ADD COLUMN goal_met TEXT', 'messages ADD COLUMN taken_by TEXT', 'messages ADD COLUMN handled INTEGER', 'runs ADD COLUMN role TEXT', 'runs ADD COLUMN session_name TEXT', 'agents ADD COLUMN cleared INTEGER DEFAULT 0', 'runs ADD COLUMN mode TEXT DEFAULT \'background\'', 'runs ADD COLUMN tty TEXT', 'runs ADD COLUMN pid INTEGER', 'runs ADD COLUMN effort TEXT', 'runs ADD COLUMN session TEXT', 'runs ADD COLUMN acked INTEGER DEFAULT 0', 'rooms ADD COLUMN instructions_version INTEGER DEFAULT 0']) try { db.exec(`ALTER TABLE ${col}`); } catch { /* already there */ }
   if (oldRooms) db.exec(`UPDATE rooms SET wake_limit=0 WHERE wake_limit=30`); // 30 was the old automatic pause; a room now runs until its goal or stop time
   // Background agents die with the server. Window agents live in Terminal and get picked back up below.
   db.exec(`UPDATE runs SET status='crashed', why='The server restarted while this agent ran', ended=${Date.now()} WHERE COALESCE(mode,'background')<>'window' AND status IN ('running','idle','waiting','terminal')`);
@@ -273,8 +273,11 @@ export function serve() {
     insert(r, 'system', 'all', 'note', `${forAgents} Finish what you're doing and update the report. Start nothing new; your user restarts this room if there's more.`);
     run(`UPDATE rooms SET paused=1, pause_why=?, until_ts=NULL WHERE id=?`, forHuman, r.id);
   }
+  const whenText = (ms) => new Date(ms).toLocaleString('en-US', { weekday: 'short', hour: 'numeric', minute: '2-digit' });
   function checkStopTimes() {
-    for (const r of q(`SELECT * FROM rooms WHERE until_ts<=? AND paused=0`, Date.now())) stopRoom(r, 'The stop time you set has passed.', 'The stop time your user set has passed.');
+    for (const r of q(`SELECT * FROM rooms WHERE until_ts<=? AND paused=0`, Date.now())) {
+      stopRoom(r, r.goal_met ? `The stop time you set has passed. Goal met earlier: ${r.goal_met}` : "The stop time you set has passed, and the goal isn't marked done.", 'The stop time your user set has passed.');
+    }
   }
   function drain(r, name) {
     const a = one(`SELECT * FROM agents WHERE room_id=? AND name=?`, r.id, name);
@@ -895,7 +898,20 @@ export function serve() {
         const leader = room(r.id).leader;
         const idle = [...procs.values()].filter((p) => p.roomId === r.id && p.agent !== leader).map((p) => p.agent);
         const p = leader && liveRun(r.id, leader);
-        if (p && !room(r.id).paused) {
+        const here = room(r.id);
+        if (p && !here.paused && here.until_ts && here.past_goal) {
+          // The human asked for this much working time, so an idle crew gets sent back to work. Reminders space out until the tasks change.
+          state.timed ??= new Map();
+          const sig = q(`SELECT id, status FROM tasks WHERE room_id=? ORDER BY id`, r.id).map((t) => `${t.id}:${t.status}`).join('|');
+          let t = state.timed.get(r.id);
+          if (!t || t.sig !== sig) t = { sig, gap: QUIET_MS, at: 0 };
+          state.timed.set(r.id, t);
+          if (Date.now() - t.at >= t.gap) {
+            t.at = Date.now();
+            t.gap = Math.min(t.gap * 2, 1800e3);
+            writeTurn(p, `From the room: Your user wants this room working until ${whenText(here.until_ts)}, and nobody is working right now.${here.goal_met ? ' The goal is met, so improve on it: test it harder, fix weak spots, finish what was cut.' : ''}${open.length ? ` Open tasks: ${open.map(taskLine).join('; ')}.` : ''} As leader, pick the most valuable next work that serves the goal, make tasks and assign them with @name. Decide this yourself: your user asked for this time to be used and isn't there to ask what's next.`);
+          }
+        } else if (p && !here.paused) {
           const sig = open.map(taskLine).join('|');
           const last = state.seen.get(r.id);
           const n = last?.sig === sig ? last.n + 1 : 1;
@@ -1170,6 +1186,13 @@ export function serve() {
       const leader = room(r.id).leader;
       if (leader !== a.name) throw new Refuse(403, `Only the leader, ${leader}, can say the goal is done. Tell them with @${leader}.`);
       if (!why) throw new Refuse(400, 'Say what shows the goal is done: goal done WHY');
+      const now = room(r.id);
+      if (now.until_ts && now.past_goal) {
+        run(`UPDATE rooms SET goal_met=? WHERE id=?`, why, r.id);
+        insert(r, 'system', 'all', 'note', `${a.name} says the goal is done: ${why} Your user wants this room working until ${whenText(now.until_ts)}, so keep going: improve it, test it harder, fix weak spots. Decide the next work yourselves; your user isn't there to ask.`);
+        return `goal noted; your user wants work until ${whenText(now.until_ts)}, so pick the next most valuable work and make tasks, without asking your user`;
+      }
+      run(`UPDATE rooms SET goal_met=? WHERE id=?`, why, r.id);
       stopRoom(r, `Goal done, says ${a.name}: ${why}`, `${a.name} says the goal is done: ${why}`);
       if (r.parent_id) { const up = room(r.parent_id); insert(up, 'system', up.leader || null, 'note', `The ${r.slug} division says its goal is done: ${why}`); }
       return 'goal done; the room has stopped until your user restarts it';
@@ -1243,7 +1266,7 @@ export function serve() {
     return {
       windows_available: windowsAvailable(),
       default_mode: config.default_mode || (windowsAvailable() ? 'window' : 'background'),
-      room: { id: r.id, slug: r.slug, path: pathOf(r), parent_id: r.parent_id, brief: r.brief, dir: r.dir, effective_dir: dirOf(r), instructions: r.instructions, instructions_version: r.instructions_version, effective_instructions: instructionsOf(r), security: r.security, effective_security: securityOf(r), budget_usd: r.budget_usd, wake_limit: r.wake_limit, until_ts: r.until_ts, wakes: r.wakes, paused: !!r.paused },
+      room: { id: r.id, slug: r.slug, path: pathOf(r), parent_id: r.parent_id, brief: r.brief, dir: r.dir, effective_dir: dirOf(r), instructions: r.instructions, instructions_version: r.instructions_version, effective_instructions: instructionsOf(r), security: r.security, effective_security: securityOf(r), budget_usd: r.budget_usd, wake_limit: r.wake_limit, until_ts: r.until_ts, past_goal: r.past_goal, goal_met: r.goal_met, wakes: r.wakes, paused: !!r.paused },
       crumbs: [...ancestors(r).reverse(), r].map((x) => ({ id: x.id, slug: x.slug })),
       leader,
       word_limit: wordLimit(r),
@@ -1372,9 +1395,15 @@ export function serve() {
       run(`DELETE FROM rooms WHERE id=?`, r.id);
       return { ok: true, parent_id: r.parent_id };
     },
-    settings({ id, brief, dir, instructions, instructions_base, security, budget_usd, wake_limit, until_ts }) {
+    settings({ id, brief, dir, instructions, instructions_base, security, budget_usd, wake_limit, until_ts, past_goal }) {
       const r = need(id);
-      if (brief !== undefined) run(`UPDATE rooms SET brief=? WHERE id=?`, scrub(capped(brief, MAX_BRIEF, 'goal')).trim(), r.id);
+      if (brief !== undefined) {
+        const next = scrub(capped(brief, MAX_BRIEF, 'goal')).trim();
+        if (next !== r.brief) {
+          run(`UPDATE rooms SET brief=?, goal_met=NULL WHERE id=?`, next, r.id);
+          if (next && room(r.id).leader) insert(r, 'system', room(r.id).leader, 'note', `Your user changed the goal: ${next}`);
+        }
+      }
       if (dir !== undefined) {
         const d = String(dir).trim();
         if (d && !(existsSync(d) && statSync(d).isDirectory())) throw new Refuse(400, `That folder doesn't exist: ${d}`);
@@ -1397,6 +1426,11 @@ export function serve() {
       if (until_ts !== undefined) {
         if (until_ts !== null && !(Number(until_ts) > Date.now())) throw new Refuse(400, 'Pick a stop time in the future');
         run(`UPDATE rooms SET until_ts=? WHERE id=?`, until_ts === null ? null : Number(until_ts), r.id);
+      }
+      if (past_goal !== undefined) run(`UPDATE rooms SET past_goal=? WHERE id=?`, past_goal ? 1 : 0, r.id);
+      if (until_ts != null || past_goal !== undefined) {
+        const f = room(r.id);
+        if (f.until_ts && f.leader) insert(r, 'system', f.leader, 'note', `Your user wants this room working until ${whenText(f.until_ts)}, ${f.past_goal ? 'even if the goal is met sooner: run goal done, then keep improving it, deciding the next work yourself.' : 'or until the goal is met, whichever comes first.'}`);
       }
       if (wake_limit !== undefined) {
         if (!(Number(wake_limit) >= 0)) throw new Refuse(400, "wake limit can't be negative");
@@ -1472,7 +1506,7 @@ export function serve() {
     },
     resume({ id }) {
       const r = need(id);
-      run(`UPDATE rooms SET paused=0, wakes=0, pause_why=NULL WHERE id=?`, r.id);
+      run(`UPDATE rooms SET paused=0, wakes=0, pause_why=NULL, goal_met=NULL WHERE id=?`, r.id);
       insert(r, 'system', null, 'note', 'Resumed.');
       for (const w of [...waiters]) if (w.roomId === r.id && hasAddressedUnread(r, w.agent)) w.deliver();
       for (const p of procs.values()) if (p.roomId === r.id) for (const m of p.held?.splice(0) ?? []) deliverToAgent(p, m);

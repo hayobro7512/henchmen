@@ -416,6 +416,30 @@ test('a room runs until the leader says the goal is done or the stop time passes
   assert.equal(v.room.until_ts, null);
 });
 
+test('with a stop time the crew keeps working past the goal, unless told to stop at the goal', async () => {
+  br(['new', 'timed']);
+  const id = roomId('timed');
+  br(['timed', 'a', 'sync']);
+  await page('settings', { id, until_ts: Date.now() + 3600e3 });
+  assert.equal(br(['timed', 'a', 'goal', 'done', 'first pass works']).code, 0);
+  let v = await view('timed');
+  assert.ok(!v.room.paused);
+  assert.equal(v.room.goal_met, 'first pass works');
+  assert.ok(v.messages.some((m) => /keep going: improve it/.test(m.body)));
+  await page('settings', { id, brief: 'a new goal' });
+  v = await view('timed');
+  assert.equal(v.room.goal_met, null); // a new goal isn't met yet
+  assert.ok(v.messages.some((m) => /changed the goal: a new goal/.test(m.body)));
+  await page('settings', { id, past_goal: 0 });
+  assert.equal(br(['timed', 'a', 'goal', 'done', 'new goal works']).code, 0);
+  assert.ok((await view('timed')).room.paused);
+  await page('resume', { id });
+  await page('settings', { id, past_goal: 1, until_ts: Date.now() + 1200 });
+  br(['timed', 'a', 'goal', 'done', 'met again']);
+  v = await until2(async () => { const x = await view('timed'); return x.room.paused && x; });
+  assert.match(v.needs.find((n) => n.type === 'paused').body, /stop time.*Goal met earlier: met again/);
+});
+
 test('the server pauses waking at the limit until the human resumes', async () => {
   br(['new', 'loop']);
   const id = roomId('loop');

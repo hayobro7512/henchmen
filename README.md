@@ -72,7 +72,9 @@ To make Full access your own default for rooms that don't set a level, put `{"de
 
 ## How long it runs
 
-A room keeps going until its leader says the goal is done, or the stop time you set in **Room settings** passes. Either way the agents are told to wrap up, and **Keep going** on the page restarts them. If everyone stops early, the leader is reminded twice, then the chat says so.
+Set the goal at the top of the report, or in **Room settings**. With no stop time, a room keeps going until its leader says the goal is done. If everyone stops early, the leader is reminded twice, then the chat says so.
+
+Set a stop time to run for a fixed time, such as 5 hours. By default the crew uses all of it: if the goal is met after 3 hours, the leader finds improvements on its own for the last 2. To stop as soon as the goal is met, change **If the goal is met before the stop time**. The stop time always ends the run, and **Keep going** on the page restarts it.
 
 ## Spending
 

@@ -459,7 +459,10 @@ function buildRoom() {
   E.emptyReport = h('div', { class: 'empty', hidden: true });
   E.words = h('span', {});
   E.addBtn = h('button', { class: 'text-btn', type: 'button', disabled: !R.owner, onclick: openAddSection }, 'Add section');
-  E.report.append(E.emptyReport, E.sections, E.addSlot, E.rollups, E.details, h('div', { class: 'report-foot' }, E.words, E.addBtn));
+  E.goalText = h('span', {});
+  E.goalEdit = h('button', { class: 'text-btn', type: 'button', onclick: openSettings });
+  E.goalRule = h('div', { class: 'goal-rule' });
+  E.report.append(h('div', { class: 'goal' }, h('strong', {}, 'Goal: '), E.goalText, ' ', E.goalEdit, E.goalRule), E.emptyReport, E.sections, E.addSlot, E.rollups, E.details, h('div', { class: 'report-foot' }, E.words, E.addBtn));
 
   E.chat = h('div', { class: 'chat', tabindex: '0', role: 'log', 'aria-label': 'Discussion messages', onscroll: onChatScroll });
   E.jump = h('button', { class: 'btn jump', type: 'button', hidden: true, onclick: () => { scrollChatEnd(); onChatScroll(); } });
@@ -518,7 +521,7 @@ function renderTop(v) {
     E.crumbs.replaceChildren(...parts);
   }
   document.title = `${v.needs.length ? `(${v.needs.length}) ` : ''}${v.room.path} | Henchmen`;
-  const stops = v.room.until_ts ? `, stops ${new Date(v.room.until_ts).toLocaleString([], { weekday: 'short', hour: 'numeric', minute: '2-digit' })}` : '';
+  const stops = v.room.until_ts ? `, stops ${stopWhen(v.room.until_ts)}` : '';
   const lead = (v.leader ? `Led by ${v.leader}, ${v.agents.filter((a) => a.here).length} here` : 'Nobody here yet') + stops;
   if (E.lead.textContent !== lead) { E.lead.textContent = lead; E.lead.title = lead; }
   E.fullAccess.hidden = v.room.effective_security !== 'full';
@@ -861,8 +864,19 @@ function sectionEntry(name) {
 const rollupText = (body) => body.replace(/^\s*(#{1,3}|>)\s+/gm, '').replace(/\*\*|`/g, '').replace(/\s+/g, ' ').trim();
 function paintBody(e) { e.body.innerHTML = markdown(e.s.body, e.marks); }
 function metaText(s) { return `updated ${ago(s.ts)} by ${s.by === 'human' ? 'you' : s.by}`; }
+const stopWhen = (ms) => new Date(ms).toLocaleString([], { weekday: 'short', hour: 'numeric', minute: '2-digit' });
+function renderGoal(r) {
+  const E = R.el;
+  E.goalText.textContent = r.brief || 'No goal set yet.';
+  E.goalEdit.textContent = r.brief ? 'Change' : 'Set goal';
+  const rule = r.paused ? '' : !r.until_ts ? 'Runs until the leader says the goal is done.'
+    : r.past_goal ? `Runs until ${stopWhen(r.until_ts)}, improving after the goal is met.`
+    : `Runs until ${stopWhen(r.until_ts)}, or until the goal is met.`;
+  E.goalRule.textContent = [r.goal_met && `Goal met: ${r.goal_met}`, rule].filter(Boolean).join(' ');
+}
 function renderReport(v) {
   const E = R.el;
+  renderGoal(v.room);
   const firstEver = R.seen == null;
   if (firstEver) R.seen = {};
   const live = new Set();
@@ -1633,7 +1647,7 @@ function openSettings() {
       const brief = h('textarea', { rows: 3, value: r.brief || '' });
       const dir = h('input', { value: r.dir || '', spellcheck: 'false', placeholder: r.dir ? '' : r.effective_dir ? `Using the parent's: ${r.effective_dir}` : 'None set' });
       // What the server holds. Saving sends only what differs, and says Saved only for what it read back.
-      const base = { brief: r.brief || '', dir: r.dir || '', instructions: r.instructions, version: r.instructions_version, budget: r.budget_usd ?? null, wake: r.wake_limit, until: r.until_ts ?? null };
+      const base = { brief: r.brief || '', dir: r.dir || '', instructions: r.instructions, version: r.instructions_version, budget: r.budget_usd ?? null, wake: r.wake_limit, until: r.until_ts ?? null, past: r.past_goal };
       let own = r.effective_instructions;
       let fallback = r.instructions == null ? r.effective_instructions : null; // what ticking the box puts on screen, once known
       const instr = h('textarea', {
@@ -1658,12 +1672,15 @@ function openSettings() {
       const wake = h('input', { type: 'number', min: '1', step: '1', value: r.wake_limit || '', placeholder: 'No limit' });
       const localTime = (ms) => { const t = new Date(ms); t.setMinutes(t.getMinutes() - t.getTimezoneOffset()); return t.toISOString().slice(0, 16); };
       const stopAt = h('input', { type: 'datetime-local', value: r.until_ts ? localTime(r.until_ts) : '' });
+      const hours = h('input', { type: 'number', min: '0.1', step: '0.5', placeholder: 'Hours', oninput: () => { stopAt.value = hours.value ? localTime(Date.now() + Number(hours.value) * 3600e3) : ''; } });
+      const early = h('select', {}, h('option', { value: '1' }, 'Keep improving until the stop time'), h('option', { value: '0' }, 'Stop as soon as the goal is met'));
+      early.value = r.past_goal ? '1' : '0';
       const saveErr = h('p', { class: 'err', role: 'alert' });
       const saveOk = h('span', { class: 'hint', role: 'status' });
       const saveBtn = h('button', { class: 'btn primary', type: 'submit' }, 'Save settings');
       const readBack = async () => {
         const fresh = (await getJSON(`/api/room/${r.id}?after=${2 ** 52}`)).room;
-        Object.assign(base, { brief: fresh.brief || '', dir: fresh.dir || '', instructions: fresh.instructions, version: fresh.instructions_version, budget: fresh.budget_usd ?? null, wake: fresh.wake_limit, until: fresh.until_ts ?? null });
+        Object.assign(base, { brief: fresh.brief || '', dir: fresh.dir || '', instructions: fresh.instructions, version: fresh.instructions_version, budget: fresh.budget_usd ?? null, wake: fresh.wake_limit, until: fresh.until_ts ?? null, past: fresh.past_goal });
         return fresh;
       };
       const showStale = async (text) => {
@@ -1688,9 +1705,10 @@ function openSettings() {
               brief: brief.value.trim(), dir: dir.value.trim(), instructions: inherit.checked ? null : instr.value,
               budget_usd: budget.value === '' ? null : Number(budget.value), wake_limit: wake.value === '' ? 0 : Math.floor(Number(wake.value)),
               until_ts: stopAt.value ? new Date(stopAt.value).getTime() : null,
+              past_goal: Number(early.value),
             };
             if (want.instructions != null && !want.instructions.trim()) throw new Error(`Write some instructions, or tick "${inheritLabel}".`);
-            const fields = [['brief', 'goal', base.brief], ['dir', 'working folder', base.dir], ['instructions', 'instructions', base.instructions], ['budget_usd', 'budget', base.budget], ['until_ts', 'stop time', base.until], ['wake_limit', 'wake-up limit', base.wake]];
+            const fields = [['brief', 'goal', base.brief], ['dir', 'working folder', base.dir], ['instructions', 'instructions', base.instructions], ['budget_usd', 'budget', base.budget], ['until_ts', 'stop time', base.until], ['past_goal', 'goal rule', base.past], ['wake_limit', 'wake-up limit', base.wake]];
             const changed = fields.filter(([key, , was]) => want[key] !== was);
             if (!changed.length) { saved(saveOk, 'Nothing to save: this already matches.'); return; }
             const args = { id: r.id };
@@ -1705,7 +1723,7 @@ function openSettings() {
             }
             const fresh = await readBack();
             // A folder comes back as a full path, so only whether one is set can be compared.
-            const stored = { brief: base.brief, dir: want.dir && base.dir ? want.dir : base.dir, instructions: base.instructions, budget_usd: base.budget, wake_limit: base.wake, until_ts: base.until };
+            const stored = { brief: base.brief, dir: want.dir && base.dir ? want.dir : base.dir, instructions: base.instructions, budget_usd: base.budget, wake_limit: base.wake, until_ts: base.until, past_goal: base.past };
             const lost = changed.filter(([key]) => stored[key] !== want[key]).map(([, label]) => label);
             const done = changed.map(([, label]) => label).filter((label) => !lost.includes(label));
             unstale();
@@ -1722,7 +1740,9 @@ function openSettings() {
         h('label', { class: 'check' }, inherit, inheritLabel),
         h('div', { class: 'editor' }),
         field('Budget in dollars', budget, `Agents won't start if their cap doesn't fit.${spendText(v.spend) ? ` ${spendText(v.spend)} so far.` : ''}`),
+        field('Run for', hours, 'Fills in the stop time below.'),
         field('Stop at', stopAt, "Blank: agents keep going until the leader says the goal is done. Agents in windows use your plan's usage the whole time."),
+        field('If the goal is met before the stop time', early, 'Only applies when a stop time is set.'),
         field('Wake-up limit', wake, `Optional. Pauses after this many wake-ups with no input from you. Current count: ${v.room.wakes}.`),
         saveErr, h('div', { class: 'row' }, saveBtn, saveOk));
 

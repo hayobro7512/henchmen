@@ -270,6 +270,8 @@ label.field > span:first-child, .field-label { display: block; font-weight: 700;
 
 /* Report */
 .report { background: var(--paper); overflow: auto; min-height: 0; padding: 6px 24px 8px 18px; display: flex; flex-direction: column; }
+.goal { padding: 10px 0 12px 14px; border-bottom: 1px solid var(--line); line-height: 1.45; overflow-wrap: anywhere; }
+.goal-rule { color: var(--muted); font-size: 13.5px; }
 .sec { position: relative; padding: 12px 0 14px 10px; line-height: 1.45; border-left: 4px solid transparent; }
 .sec + .sec { border-top: 1px solid var(--line); }
 .sec.changed { border-left-color: var(--note); }
