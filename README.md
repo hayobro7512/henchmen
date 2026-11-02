@@ -14,9 +14,20 @@ It runs only on your computer, and works with Claude Code for now.
 
 You need [Claude Code](https://code.claude.com) and Node 22.13 or newer.
 
+Paste this into Claude Code:
+
+```text
+Install the Henchmen plugin for Claude Code. Check that node --version is 22.13 or newer. Then run: claude plugin marketplace add hayobro7512/henchmen && claude plugin install henchmen@henchmen
+When it finishes, tell me whether it worked and that I need to restart Claude Code to use it.
+```
+
+Or run it yourself in a terminal:
+
 ```sh
 claude plugin marketplace add hayobro7512/henchmen && claude plugin install henchmen@henchmen
 ```
+
+Then restart Claude Code.
 
 ## Use it
 
