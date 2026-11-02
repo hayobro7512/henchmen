@@ -1672,7 +1672,7 @@ function openSettings() {
       const wake = h('input', { type: 'number', min: '1', step: '1', value: r.wake_limit || '', placeholder: 'No limit' });
       const localTime = (ms) => { const t = new Date(ms); t.setMinutes(t.getMinutes() - t.getTimezoneOffset()); return t.toISOString().slice(0, 16); };
       const stopAt = h('input', { type: 'datetime-local', value: r.until_ts ? localTime(r.until_ts) : '' });
-      const hours = h('input', { type: 'number', min: '0.1', step: '0.5', placeholder: 'Hours', oninput: () => { stopAt.value = hours.value ? localTime(Date.now() + Number(hours.value) * 3600e3) : ''; } });
+      const hours = h('input', { type: 'number', min: '0', step: 'any', placeholder: 'Hours', oninput: () => { stopAt.value = hours.value ? localTime(Date.now() + Number(hours.value) * 3600e3) : ''; } });
       const early = h('select', {}, h('option', { value: '1' }, 'Keep improving until the stop time'), h('option', { value: '0' }, 'Stop as soon as the goal is met'));
       early.value = r.past_goal ? '1' : '0';
       const saveErr = h('p', { class: 'err', role: 'alert' });
@@ -1740,7 +1740,7 @@ function openSettings() {
         h('label', { class: 'check' }, inherit, inheritLabel),
         h('div', { class: 'editor' }),
         field('Budget in dollars', budget, `Agents won't start if their cap doesn't fit.${spendText(v.spend) ? ` ${spendText(v.spend)} so far.` : ''}`),
-        field('Run for', hours, 'Fills in the stop time below.'),
+        field('Run for (hours)', hours, 'Fills in the stop time below.'),
         field('Stop at', stopAt, "Blank: agents keep going until the leader says the goal is done. Agents in windows use your plan's usage the whole time."),
         field('If the goal is met before the stop time', early, 'Only applies when a stop time is set.'),
         field('Wake-up limit', wake, `Optional. Pauses after this many wake-ups with no input from you. Current count: ${v.room.wakes}.`),
