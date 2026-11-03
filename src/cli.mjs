@@ -13,7 +13,7 @@ henchmen revoke               sign every browser out of owner rights
 henchmen stop                 stop the server and every agent it started
 henchmen talk ROOM AGENT      this agent's own terminal tab: watch it work and type to it directly
 henchmen ROOM ME sync         goal, leader, tasks, claims, unread (first sync also gives your instructions)
-henchmen ROOM ME post KIND [@NAME|@all|@human] [text, or stdin]
+henchmen ROOM ME post KIND [@NAME|@all|@human] [--reply ID] [text, or stdin]
                                KIND: note ask answer done decision blocked. Only @ wakes anyone.
 henchmen ROOM ME wait [secs]  block until a message for you, then print unread (default 1800). Terminal agents only.
 henchmen ROOM ME doing [text]
@@ -28,7 +28,8 @@ henchmen ROOM ME task assign ID [@OWNER]        leader only
 henchmen ROOM ME task status ID open|doing|blocked|done   owner or leader
 henchmen ROOM ME report show
 henchmen ROOM ME report set SECTION [--base V] [text, or stdin]   exit 1 with STALE or REFUSED and nothing saved
-henchmen ROOM ME detail [NAME] [text, or stdin]   no text reads the page, no NAME lists pages
+henchmen ROOM ME detail [NAME] [--show|--hide] [text, or stdin]   no text reads the page, no NAME lists pages. Pages stay off the human's report unless you --show them
+henchmen ROOM ME pass ID @NAME   give the human's message you have to the agent whose work it is; it goes straight to them, so post nothing
 henchmen ROOM ME take ID      take a message from the human that nobody has yet; the first to take it has it
 henchmen ROOM ME resolve ID   close your own blocker, question or taken message (leader: anyone's)
 henchmen ROOM ME goal done WHY  leader only: the goal is met and checked, so the room stops until the human restarts it
@@ -211,6 +212,7 @@ async function main(argv) {
   const args = { room, agent, cmd };
   const text = async () => rest.join(' ') || await stdinText();
   if (cmd === 'post') {
+    args.reply = flag(rest, '--reply');
     args.kind = rest.shift();
     if (rest[0]?.startsWith('@')) args.target = rest.shift().slice(1);
     args.body = await text();
@@ -226,6 +228,7 @@ async function main(argv) {
   } else if (cmd === 'wait') args.secs = rest[0];
   else if (cmd === 'log') args.n = rest[0];
   else if (cmd === 'show' || cmd === 'resolve' || cmd === 'take') args.id = rest[0];
+  else if (cmd === 'pass') [args.id, args.target] = rest;
   else if (cmd === 'task') {
     args.sub = rest.shift();
     if (args.sub === 'add') {
@@ -244,6 +247,10 @@ async function main(argv) {
       args.body = await text();
     } else if (args.sub !== 'show') return finish({ ok: false, text: 'report show | report set SECTION [--base V] [text, or stdin]' });
   } else if (cmd === 'detail') {
+    for (const [f, on] of [['--show', true], ['--hide', false]]) {
+      const i = rest.indexOf(f);
+      if (i >= 0) { rest.splice(i, 1); args.show = on; }
+    }
     args.name = rest.shift();
     args.body = rest.length ? rest.join(' ') : args.name ? await stdinText() : '';
   }

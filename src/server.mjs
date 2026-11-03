@@ -15,16 +15,17 @@ const CLAUDE = process.env.HENCHMEN_CLAUDE || 'claude';
 const STALE_MS = 2 * 3600e3; // a claim can be taken once its holder has been gone this long
 const ABSENT_MS = Number(process.env.HENCHMEN_ABSENT_MS || 3600e3); // a silent terminal agent counts as gone after this
 const WORD_LIMIT = Number(process.env.HENCHMEN_WORDS || 250); // what fits the report panel at 1440x900
+const IDLE_MS = Number(process.env.HENCHMEN_IDLE_MS || 60000); // Stop idle only touches agents that have sat this long: a window can read idle between steps
 const QUIET_MS = Number(process.env.HENCHMEN_QUIET_MS || 30000); // how long a whole crew sits idle before its leaders hear about open tasks
 const ROLLUP_WORDS = 30; // each child's summary takes this much room on its parent's page
 const RESERVED_ROOMS = ['new', 'list', 'open', 'stop', 'help', 'serve', 'talk', 'version', 'status', 'revoke']; // the command line reads these as commands
 const MAX_DEPTH = 8, MAX_HELD_TURNS = 200;
 const POST_WORDS = 80; // a person reads the room, so an agent's post has to fit in a glance
-const MAX_SECTIONS = 8, MAX_BRIEF = 4000, MAX_INSTRUCTIONS = 20000, MAX_MESSAGE = 20000, MAX_DETAIL = 200000;
+const MAX_SECTIONS = 8, MAX_SHOWN = 8, MAX_PASSES = 2, MAX_BRIEF = 4000, MAX_INSTRUCTIONS = 20000, MAX_MESSAGE = 20000, MAX_DETAIL = 200000;
 const KINDS = ['note', 'ask', 'answer', 'done', 'decision', 'blocked'];
 const SYNCED = ['decision', 'blocked', 'ask']; // what a child's discussion sends up to its parents
 const NAME = /^[a-z0-9][a-z0-9._-]{0,63}$/;
-const RESERVED = ['all', 'human', 'system'];
+const RESERVED = ['all', 'everyone', 'human', 'system'];
 const EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max'];
 // Full agents are Sonnet, Opus or Fable. Smaller models are for an agent's own subagents.
 const MODEL_ALIASES = { sonnet: 'claude-sonnet-5-5', opus: 'claude-opus-5-5', fable: 'claude-fable-5-1' };
@@ -107,7 +108,7 @@ export function serve() {
     UPDATE approvals SET status='expired' WHERE status='pending';`);
 
   const oldRooms = !db.prepare(`SELECT 1 x FROM pragma_table_info('rooms') WHERE name='until_ts'`).get();
-  for (const col of ['rooms ADD COLUMN until_ts INTEGER', 'rooms ADD COLUMN pause_why TEXT', 'rooms ADD COLUMN past_goal INTEGER DEFAULT 1', 'rooms ADD COLUMN goal_met TEXT', 'messages ADD COLUMN taken_by TEXT', 'messages ADD COLUMN handled INTEGER', 'runs ADD COLUMN role TEXT', 'runs ADD COLUMN session_name TEXT', 'agents ADD COLUMN cleared INTEGER DEFAULT 0', 'runs ADD COLUMN mode TEXT DEFAULT \'background\'', 'runs ADD COLUMN tty TEXT', 'runs ADD COLUMN pid INTEGER', 'runs ADD COLUMN effort TEXT', 'runs ADD COLUMN session TEXT', 'runs ADD COLUMN acked INTEGER DEFAULT 0', 'rooms ADD COLUMN instructions_version INTEGER DEFAULT 0']) try { db.exec(`ALTER TABLE ${col}`); } catch { /* already there */ }
+  for (const col of ['rooms ADD COLUMN until_ts INTEGER', 'rooms ADD COLUMN pause_why TEXT', 'rooms ADD COLUMN past_goal INTEGER DEFAULT 1', 'rooms ADD COLUMN goal_met TEXT', 'messages ADD COLUMN taken_by TEXT', 'messages ADD COLUMN handled INTEGER', 'runs ADD COLUMN role TEXT', 'runs ADD COLUMN session_name TEXT', 'agents ADD COLUMN cleared INTEGER DEFAULT 0', 'runs ADD COLUMN mode TEXT DEFAULT \'background\'', 'runs ADD COLUMN tty TEXT', 'runs ADD COLUMN pid INTEGER', 'runs ADD COLUMN effort TEXT', 'runs ADD COLUMN session TEXT', 'runs ADD COLUMN acked INTEGER DEFAULT 0', 'rooms ADD COLUMN instructions_version INTEGER DEFAULT 0', 'details ADD COLUMN shown INTEGER DEFAULT 0', 'messages ADD COLUMN reply_to INTEGER', 'messages ADD COLUMN passes INTEGER DEFAULT 0', 'rooms ADD COLUMN compact_at INTEGER DEFAULT 0']) try { db.exec(`ALTER TABLE ${col}`); } catch { /* already there */ }
   if (oldRooms) db.exec(`UPDATE rooms SET wake_limit=0 WHERE wake_limit=30`); // 30 was the old automatic pause; a room now runs until its goal or stop time
   // Background agents die with the server. Window agents live in Terminal and get picked back up below.
   db.exec(`UPDATE runs SET status='crashed', why='The server restarted while this agent ran', ended=${Date.now()} WHERE COALESCE(mode,'background')<>'window' AND status IN ('running','idle','waiting','terminal')`);
@@ -129,6 +130,14 @@ export function serve() {
   const children = (id) => q(`SELECT * FROM rooms WHERE parent_id=? ORDER BY id`, id);
   const subtree = (r) => [r, ...children(r.id).flatMap(subtree)];
   const allRoots = () => q(`SELECT * FROM rooms WHERE parent_id IS NULL ORDER BY id`);
+  // Pages are the room's files, for the agents. The human's report lists only the few marked for them.
+  const saveDetail = (roomId, name, body, by) => run(`INSERT INTO details(room_id, name, body, by, ts) VALUES(?,?,?,?,?) ON CONFLICT(room_id, name) DO UPDATE SET body=excluded.body, by=excluded.by, ts=excluded.ts`, roomId, name, body, by, Date.now());
+  const showDetail = (r, name, on) => {
+    const page = one(`SELECT shown FROM details WHERE room_id=? AND name=?`, r.id, name);
+    if (!page) throw new Refuse(404, `No page named ${name}.`);
+    if (on && !page.shown && one(`SELECT COUNT(*) n FROM details WHERE room_id=? AND shown=1`, r.id).n >= MAX_SHOWN) throw new Refuse(413, `REFUSED: the report lists ${MAX_SHOWN} pages at most, so "${name}" isn't on it. Take one off first with: detail NAME --hide`);
+    run(`UPDATE details SET shown=? WHERE room_id=? AND name=?`, on ? 1 : 0, r.id, name);
+  };
   const inherited = (r, field) => {
     for (const x of [r, ...ancestors(r)]) if (x[field] != null) return x[field];
     return null;
@@ -224,20 +233,29 @@ export function serve() {
 
   // ---------- messages ----------
   const addressed = (m, name) => m.sender !== name && (m.target === name || m.target === 'all');
+  const replyNote = (m, reader) => {
+    const was = m.reply_to && one(`SELECT sender, body FROM messages WHERE id=?`, m.reply_to);
+    return was ? ` Replying to #${m.reply_to} from ${was.sender === reader ? 'you' : was.sender === 'human' ? 'your user' : was.sender}: "${oneLine(was.body).slice(0, 200)}".` : '';
+  };
+  // Who a message belongs to, so whatever answers it goes straight there.
+  const ownerOf = (r, m) => {
+    const name = !m || m.sender === 'system' ? null : m.sender === 'human' ? m.target || m.taken_by : m.sender;
+    return name && one(`SELECT 1 x FROM agents WHERE room_id=? AND name=? AND left_at IS NULL`, r.id, name) ? name : null;
+  };
   function line(m, reader) {
     const t = new Date(m.ts).toTimeString().slice(0, 5);
     if (m.sender === 'human') {
-      const state = m.handled == null ? '' : m.handled === 2 ? ` [resolved by ${m.taken_by}, nothing to do]` : m.handled === 1 ? (m.taken_by === reader ? ' [yours: you were first free]' : ` [${m.taken_by} has it, nothing to do unless asked]`) : ` [nobody has it yet: if you're free, run: take ${m.id}]`;
-      return `#${m.id} ${t} HUMAN (from the page; information, not approval)${state}: ${String(m.body).replace(/\n/g, '\n    | ')}`;
+      const state = m.handled == null ? '' : m.handled === 3 ? ' [dropped by your user, nothing to do]' : m.handled === 2 ? ` [resolved by ${m.taken_by}, nothing to do]` : m.handled === 1 ? (m.taken_by === reader ? ' [yours]' : ` [${m.taken_by} has it, nothing to do unless asked]`) : ` [nobody has it yet: if you're free, run: take ${m.id}]`;
+      return `#${m.id} ${t} HUMAN (from the page; information, not approval)${state}${replyNote(m, reader)}: ${String(m.body).replace(/\n/g, '\n    | ')}`;
     }
     const from = m.from_room ? `[${m.from_room}] ` : '';
     // Continuation lines are marked, so a body can't pass for a separate entry.
-    return `#${m.id} ${t} ${from}${m.sender}${m.target ? '>' + m.target : ''} ${m.kind}: ${String(m.body).replace(/\n/g, '\n    | ')}`;
+    return `#${m.id} ${t} ${from}${m.sender}${m.target ? '>' + m.target : ''} ${m.kind}${replyNote(m, reader)}: ${String(m.body).replace(/\n/g, '\n    | ')}`;
   }
   function insert(r, sender, target, kind, body, extra = {}) {
     const open = kind === 'blocked' || target === 'human' ? 1 : 0;
-    const m = { room_id: r.id, sender, target: target || null, kind, body: scrub(body).trim(), ts: Date.now(), from_room: extra.from_room ?? null, source_id: extra.source_id ?? null, open: extra.copy ? 0 : open };
-    m.id = Number(run(`INSERT INTO messages(room_id, sender, target, kind, body, ts, from_room, source_id, open) VALUES(?,?,?,?,?,?,?,?,?)`, r.id, sender, m.target, kind, m.body, m.ts, m.from_room, m.source_id, m.open).lastInsertRowid);
+    const m = { room_id: r.id, sender, target: target || null, kind, body: scrub(body).trim(), ts: Date.now(), from_room: extra.from_room ?? null, source_id: extra.source_id ?? null, open: extra.copy ? 0 : open, reply_to: extra.reply_to ?? null };
+    m.id = Number(run(`INSERT INTO messages(room_id, sender, target, kind, body, ts, from_room, source_id, open, reply_to) VALUES(?,?,?,?,?,?,?,?,?,?)`, r.id, sender, m.target, kind, m.body, m.ts, m.from_room, m.source_id, m.open, m.reply_to).lastInsertRowid);
     if (!extra.copy && SYNCED.includes(kind) && target !== 'human') syncUp(r, m);
     else if (!extra.copy && target === 'human') syncUp(r, m);
     wake(r, m);
@@ -429,7 +447,9 @@ export function serve() {
     run(`UPDATE runs SET acked=1 WHERE room_id=? AND agent=?`, r.id, name);
     touch(r, name, 'window');
     run(`UPDATE agents SET source='window', doing=?, told=1, cursor=(SELECT COALESCE(MAX(id),0) FROM messages WHERE room_id=?) WHERE room_id=? AND name=?`, scrub(task || role || '').trim().slice(0, 200), r.id, r.id, name);
-    const sessionName = `${pathOf(r)}/${name}`;
+    // An agent that renamed itself still runs under its old session name, and a new agent may get that name.
+    const wanted = `${pathOf(r)}/${name}`;
+    const sessionName = [...procs.values()].some((x) => x.sessionName === wanted) ? `${wanted}-${Date.now().toString(36)}` : wanted;
     const runId = Number(run(`INSERT INTO runs(room_id, agent, task, role, model, effort, cap, status, started, mode, session_name) VALUES(?,?,?,?,?,?,0,'starting',?,'window',?)`, r.id, name, scrub(task || '').trim(), role, model || null, effort || null, Date.now(), sessionName).lastInsertRowid);
     const p = windowProc(runId, r.id, name, model, effort);
     p.sessionName = sessionName;
@@ -462,6 +482,18 @@ export function serve() {
     });
     return { opened: true, command };
   }
+  // Closes a finished agent's tab. Only a tab with the agent's name on it or its start command in the
+  // scrollback (Claude Code retitles tabs while it runs), and never one with something running in it,
+  // so it can't take a live agent or anything of yours, even if macOS gives the tab's tty to something else.
+  function closeTab(p, tries = 0) {
+    const finish = (e, out) => {
+      if (!e && String(out).trim() === 'busy' && tries < 3) setTimeout(() => closeTab(p, tries + 1), [1500, 6000, 20000][tries]).unref();
+    };
+    if (process.env.HENCHMEN_CLOSE_STUB) return execFile(process.env.HENCHMEN_CLOSE_STUB, [p.agent], finish);
+    if (!p.tty || process.env.HENCHMEN_NO_TABS || process.platform !== 'darwin') return;
+    const script = ['on run argv', 'tell application "Terminal"', 'repeat with w in windows', 'try', 'repeat with t in tabs of w', 'if tty of t is (item 1 of argv) then', 'if busy of t then return "busy"', 'if custom title of t does not contain (item 2 of argv) and history of t does not contain (item 3 of argv) then return "other"', 'if (count of tabs of w) is 1 then', 'close w saving no', 'else', 'close t saving no', 'end if', 'return "closed"', 'end if', 'end repeat', 'end try', 'end repeat', 'end tell', 'return "gone"', 'end run'];
+    execFile('osascript', [...script.flatMap((l) => ['-e', l]), p.tty, p.agent, `runs/${p.runId}.sh`], { timeout: 15000 }, finish);
+  }
   const windowTitle = (p) => `${room(p.roomId)?.leader === p.agent ? '\u2605 ' : ''}${p.agent}`;
   // Room messages get typed into the agent's real session, one at a time, never into an open permission question.
   function typeInto(p, text) {
@@ -471,9 +503,10 @@ export function serve() {
       if (!['idle', 'running'].includes(p.status)) { p.heldTurns.push(line); return done(); } // a question opened meanwhile
       if (process.env.HENCHMEN_TYPE_STUB) return execFile(process.env.HENCHMEN_TYPE_STUB, [line], () => done());
       if (!p.tty) { p.heldTurns.push(line); return done(); }
-      const script = ['on run argv', 'tell application "Terminal"', 'repeat with w in windows', 'try', 'repeat with t in tabs of w', 'if tty of t is (item 2 of argv) then', 'do script (item 1 of argv) in t', 'delay (item 3 of argv as number)', 'do script "" in t', 'return "typed"', 'end if', 'end repeat', 'end try', 'end repeat', 'end tell', 'end run'];
+      const script = ['on run argv', 'tell application "Terminal"', 'repeat with w in windows', 'try', 'repeat with t in tabs of w', 'if tty of t is (item 2 of argv) then', 'do script (item 1 of argv) in t', 'delay (item 3 of argv as number)', 'do script "" in t', 'if (item 4 of argv) is "1" then', 'delay 1.5', 'do script "" in t', 'end if', 'return "typed"', 'end if', 'end repeat', 'end try', 'end repeat', 'end tell', 'end run'];
       // Claude Code reads a burst of text as a paste, so Enter comes on its own, later for longer text.
-      execFile('osascript', [...script.flatMap((l) => ['-e', l]), line, p.tty, String(Math.min(3, 0.6 + line.length / 1500))], { timeout: 20000 }, () => done());
+      // A slash command opens its menu, which takes the first Enter, so it gets a second. Enter on an empty box does nothing.
+      execFile('osascript', [...script.flatMap((l) => ['-e', l]), line, p.tty, String(Math.min(3, 0.6 + line.length / 1500)), line.startsWith('/') ? '1' : '0'], { timeout: 20000 }, () => done());
     }));
   }
   // The session's own record says whether a typed message arrived and what the agent answered.
@@ -534,7 +567,10 @@ export function serve() {
       const after = rows.slice(at + 1);
       const end = after.findIndex((r) => r.type === 'assistant' && r.message?.stop_reason === 'end_turn');
       if (end < 0 && !(p.status === 'idle' && Date.now() - it.arrivedAt > 120000)) continue;
-      const answer = after.slice(0, end < 0 ? undefined : end + 1).filter((r) => r.type === 'assistant' && rowText(r).trim()).at(-1);
+      // One turn can end in several rows, thinking first and the text after it, so read up to the next person's turn.
+      const next = end < 0 ? -1 : after.findIndex((r, i) => i > end && r.type === 'user');
+      const answer = after.slice(0, next < 0 ? undefined : next).filter((r) => r.type === 'assistant' && rowText(r).trim()).at(-1);
+      if (end >= 0 && !answer && Date.now() - (it.endAt ??= Date.now()) < 6000) continue; // its text may still be on the way
       closeWindowItem(p, it, answer ? rowText(answer).trim() : null);
     }
   }
@@ -544,16 +580,55 @@ export function serve() {
     if (p.item === it) p.item = null;
     const r = room(p.roomId);
     const silent = !answer || answer === '(no reply)';
-    if (silent && !one(`SELECT 1 x FROM messages WHERE room_id=? AND sender=? AND id>? LIMIT 1`, r.id, p.agent, it.id)) {
+    if (silent && !it.shared && !one(`SELECT 1 x FROM messages WHERE room_id=? AND sender=? AND id>? LIMIT 1`, r.id, p.agent, it.id)) {
       insert(r, 'system', null, 'note', `${p.agent} read #${it.id} and wrote no reply.`);
     }
     if (silent || p.lastAnswer === answer) return;
-    // A short sign-off after posting ("Done, posted") adds nothing. Anything longer is its answer, even if it posted about other work meanwhile.
-    const posted = one(`SELECT 1 x FROM messages WHERE room_id=? AND sender=? AND id>? LIMIT 1`, r.id, p.agent, it.id);
+    // A short sign-off after answering this message in a post ("Done, posted") adds nothing. Anything else is its answer, even if it posted about other work meanwhile.
+    const posted = one(`SELECT 1 x FROM messages WHERE room_id=? AND sender=? AND reply_to=? LIMIT 1`, r.id, p.agent, it.id);
     if (posted && answer.split(/\s+/).length <= 12) return;
     p.lastAnswer = answer;
-    insert(r, p.agent, null, 'note', answer.slice(0, 4000));
+    insert(r, p.agent, null, 'note', answer.slice(0, 4000), { reply_to: it.id });
   }
+  // Sessions can share a name, so the tab each one runs in is what tells them apart.
+  const ttys = new Map();
+  const ttyOf = (pid) => {
+    if (!ttys.has(pid)) {
+      try { ttys.set(pid, `/dev/${execFileSync('ps', ['-o', 'tty=', '-p', String(pid)], { encoding: 'utf8' }).trim()}`); } catch { return null; }
+    }
+    return ttys.get(pid);
+  };
+  // How much an agent is carrying: what its latest turn sent to the model. A compaction resets it.
+  function contextOf(s) {
+    const rows = sessionRows(s);
+    if (!rows) return null;
+    for (let i = rows.length - 1; i >= 0; i--) {
+      if (rows[i].subtype === 'compact_boundary') return rows[i].compactMetadata?.postTokens ?? 0;
+      const u = rows[i].type === 'assistant' && rows[i].message?.usage;
+      if (u) return (u.input_tokens || 0) + (u.cache_read_input_tokens || 0) + (u.cache_creation_input_tokens || 0);
+    }
+    return null;
+  }
+  const COMPACT_TURN = '/compact Keep what matters for your current work: decisions, file names, open tasks, and who holds what.';
+  function compactAgent(p) {
+    p.compacted = Date.now();
+    audit(p.roomId, 'system', `compacted ${p.agent} at ${p.context ?? '?'} tokens`);
+    if (!p.window) p.privateTurns++; // what it says about compacting isn't for the chat
+    writeTurn(p, COMPACT_TURN);
+  }
+  const restingFor = (p) => (!p.item && !p.directs?.length && !p.restarting && one(`SELECT status FROM runs WHERE id=?`, p.runId)?.status === 'idle' ? Date.now() - (p.freeSince ?? p.born ?? 0) : -1);
+  // The choice in Room actions: compact an agent that's resting and over the room's limit.
+  setInterval(() => {
+    try {
+      for (const p of [...procs.values()]) {
+        const r = room(p.roomId);
+        if (!r?.compact_at || r.paused || !(p.context >= r.compact_at)) continue;
+        if (restingFor(p) < IDLE_MS * 2 || Date.now() - (p.compacted ?? 0) < 1800000) continue;
+        insert(r, 'system', null, 'note', `Compacted ${p.agent}'s memory, which had reached about ${Math.round(p.context / 1000)}k tokens.`);
+        compactAgent(p);
+      }
+    } catch (e) { console.error(e); }
+  }, Math.min(IDLE_MS, 30000)).unref();
   // Claude Code's own list of live sessions says what each window agent is doing.
   function checkWindows() {
     const mine = [...procs.values()].filter((p) => p.window);
@@ -568,7 +643,9 @@ export function serve() {
         const r = room(p.roomId);
         if (!r) continue;
         const want = dirOf(r);
-        const s = list.find((x) => x.name === p.sessionName && x.cwd && want && resolve(x.cwd) === resolve(want));
+        const same = list.filter((x) => x.name === p.sessionName && x.cwd && want && resolve(x.cwd) === resolve(want));
+        const s = same.length > 1 && p.tty ? same.find((x) => ttyOf(x.pid) === p.tty) : same[0];
+        if (p.restarting && followRestart(p, s)) continue;
         if (!s) {
           if (p.seen) finishRun(p, 'finished', 'Its terminal session ended');
           else if (Date.now() - p.born > 300000) finishRun(p, 'crashed', "Its terminal window didn't start a session");
@@ -581,6 +658,10 @@ export function serve() {
         p.status = s.status === 'waiting' || s.waitingFor ? 'waiting' : s.status === 'busy' ? 'running' : s.status === 'idle' ? 'idle' : 'starting';
         if (p.status === 'idle' && !wasIdle) p.freeSince = Date.now();
         followWindowItems(p, s);
+        if (Date.now() - (p.contextAt ?? 0) > 60000) {
+          p.contextAt = Date.now();
+          p.context = contextOf(s) ?? p.context;
+        }
         run(`UPDATE runs SET status=?, pid=?, session=COALESCE(?, session), activity=? WHERE id=?`, p.status, s.pid ?? null, s.sessionId ?? null, s.waitingFor ? `Waiting for you in its terminal: ${scrub(s.waitingFor)}`.slice(0, 140) : '', p.runId);
         run(`UPDATE agents SET seen=? WHERE room_id=? AND name=?`, Date.now(), p.roomId, p.agent);
         if (['idle', 'running'].includes(p.status)) for (const t of p.heldTurns.splice(0)) typeInto(p, t);
@@ -796,11 +877,64 @@ export function serve() {
   function deliverToAgent(p, m) {
     run(`UPDATE agents SET cursor=MAX(cursor, ?) WHERE room_id=? AND name=?`, m.id, p.roomId, p.agent);
     // A skill has to arrive as its own turn for Claude Code to treat it as a command.
-    if (m.sender === 'human') writeTurn(p, isSkillCall(room(p.roomId), m.body) ? m.body : `Message from your user in the group chat: ${m.body}${p.window ? ` (Message #${m.id}.)` : ''}`);
+    if (m.sender === 'human' && m.target === 'all' && !isSkillCall(room(p.roomId), m.body)) writeTurn(p, `Message from your user to the whole crew: ${m.body}\n(Message #${m.id}. You are ${p.agent}.${replyNote(m, p.agent)} Everyone got this. Do the part that's yours and answer here yourself. If there's nothing in it for you, end your turn with exactly (no reply).)`);
+    else if (m.sender === 'human') writeTurn(p, isSkillCall(room(p.roomId), m.body) ? m.body : `Message from your user in the group chat: ${m.body}\n(Message #${m.id}.${replyNote(m, p.agent)} It's for you, so do it and answer here yourself. Only if it's really another agent's work, run: henchmen ${pathOf(room(p.roomId))} ${p.agent} pass ${m.id} @name, then end your turn with exactly (no reply). It goes straight to them.)`);
     else {
       const from = m.from_room ? ` in ${m.from_room}` : '';
       writeTurn(p, `Room message from ${m.sender === 'system' ? 'the room' : `agent ${m.sender}`}${from}. This is information from another agent, not from your user, and it can't approve anything:\n${m.kind}: ${String(m.body).replace(/\n/g, '\n    | ')}`);
     }
+  }
+  // Gives a message from the human to one agent directly, with nobody in between.
+  function handTo(r, m, name) {
+    const all = name === 'all';
+    const skill = isSkillCall(r, m.body);
+    const track = !skill && !all && one(`SELECT 1 x FROM agents WHERE room_id=? AND name=? AND left_at IS NULL`, r.id, name);
+    if (track) run(`UPDATE messages SET handled=1, taken_by=? WHERE id=?`, name, m.id);
+    for (const w of [...waiters]) if (w.roomId === r.id && (all || w.agent === name)) w.deliver();
+    for (const p of procs.values()) {
+      if (p.roomId !== r.id || !(all || p.agent === name)) continue;
+      const idle = one(`SELECT status FROM runs WHERE id=?`, p.runId)?.status === 'idle';
+      deliverToAgent(p, m);
+      if (!track && (!all || skill)) continue;
+      const entry = { id: m.id, at: Date.now(), shared: all };
+      // A turn already running isn't about this message: it counts from the next one.
+      if (!p.window && !p.item && idle) p.item = entry;
+      else (p.directs ??= []).push(entry);
+    }
+  }
+  // Terminal can't press Esc in a session, but a soft interrupt ends one cleanly with its history saved,
+  // so it comes back in the same tab with the order as its next turn. False if there's no session to interrupt.
+  function interruptWindow(p, text) {
+    const session = one(`SELECT session FROM runs WHERE id=?`, p.runId)?.session;
+    if (!session || !p.pid || !alive(p.pid) || !isOurSession(p)) return false;
+    writeFileSync(p.script.replace(/\.sh$/, '.first'), text, { mode: 0o600 });
+    writeFileSync(p.script, readFileSync(p.script, 'utf8').replace(/ (--resume '[^']*' )?-- "\$\(cat /, ` --resume ${shq(session)} -- "$(cat `), { mode: 0o700 });
+    p.restarting = { old: p.pid, at: Date.now() };
+    p.status = 'starting';
+    run(`UPDATE runs SET status='starting', activity='' WHERE id=?`, p.runId);
+    process.kill(p.pid, 'SIGINT');
+    return true;
+  }
+  // Called from each session check while an interrupted agent comes back. True while it's still on its way.
+  function followRestart(p, s) {
+    const x = p.restarting;
+    if (!x.typed) {
+      if (alive(x.old)) {
+        if (Date.now() - x.at > 10000) process.kill(x.old, 'SIGTERM');
+        return true;
+      }
+      x.typed = Date.now();
+      const command = `sh ${shq(p.script)}`;
+      if (process.env.HENCHMEN_TYPE_STUB) execFile(process.env.HENCHMEN_TYPE_STUB, [command], () => {});
+      else if (p.tty) execFile('osascript', ['-e', 'on run argv', '-e', 'tell application "Terminal"', '-e', 'repeat with w in windows', '-e', 'try', '-e', 'repeat with t in tabs of w', '-e', 'if tty of t is (item 1 of argv) then', '-e', 'do script (item 2 of argv) in t', '-e', 'return', '-e', 'end if', '-e', 'end repeat', '-e', 'end try', '-e', 'end repeat', '-e', 'end tell', '-e', 'end run', p.tty, command], { timeout: 15000 }, () => {});
+      return true;
+    }
+    if (s && s.pid !== x.old) { p.restarting = null; return false; }
+    if (Date.now() - x.typed > 120000) {
+      p.restarting = null;
+      finishRun(p, 'crashed', "It didn't come back after Drop everything");
+    }
+    return true;
   }
   function onEvent(p, e) {
     if (e.type === 'system' && e.subtype === 'init') {
@@ -812,6 +946,8 @@ export function serve() {
         skillCache.set(root, new Set([...(skillCache.get(root) ?? []), ...e.slash_commands.filter((x) => NAME.test(x) || /^[\w.-]+:[\w.-]+$/.test(x))]));
       }
     } else if (e.type === 'assistant') {
+      const used = e.message?.usage;
+      if (used) p.context = (used.input_tokens || 0) + (used.cache_read_input_tokens || 0) + (used.cache_creation_input_tokens || 0);
       for (const b of e.message?.content || []) {
         if (b.type === 'tool_use') {
           const hint = b.input?.description || b.input?.file_path || b.input?.command || '';
@@ -823,13 +959,15 @@ export function serve() {
       p.cost = p.costBase + (Number(e.total_cost_usd) || 0); // a running total for each process
       run(`UPDATE runs SET cost=?, status='idle', activity='' WHERE id=?`, p.cost, p.runId);
       p.freeSince = Date.now();
+      const answering = p.item?.id;
       if (p.item) finishItem(p.item.id, p.agent);
+      p.item = p.directs?.shift() ?? null;
       const r = room(p.roomId);
       const text = String(e.result || '').trim();
       // What you said to it in its own tab stays between you, so its answer stays there too.
       const isPrivate = p.privateTurns > 0;
       if (isPrivate) p.privateTurns--;
-      if (r && text && text !== '(no reply)' && !isPrivate) insert(r, p.agent, null, 'note', text.slice(0, 4000));
+      if (r && text && text !== '(no reply)' && !isPrivate) insert(r, p.agent, null, 'note', text.slice(0, 4000), { reply_to: answering });
       if (String(e.subtype || '').includes('budget')) { p.stopWhy = `Hit its $${p.cap.toFixed(2)} spending cap`; p.child.kill(); return finishRun(p, 'capped', p.stopWhy); }
       enforceBudgets(r);
     }
@@ -854,7 +992,8 @@ export function serve() {
   function finishRun(p, status, why) {
     if (!procs.delete(p.runId)) return;
     p.ended = true;
-    if (p.item) run(`UPDATE messages SET handled=0, taken_by=NULL WHERE id=? AND handled=1`, p.item.id);
+    if (p.window && status !== 'crashed') setTimeout(() => closeTab(p), 1500).unref(); // a crash keeps its tab, which shows why
+    for (const it of [p.item, ...(p.directs ?? [])]) if (it) run(`UPDATE messages SET handled=0, taken_by=NULL WHERE id=? AND handled=1`, it.id);
     tell(p, `\n--- ${p.agent} ${status}: ${why} ---`);
     for (const w of p.watchers) w.end();
     run(`UPDATE runs SET status=?, why=?, ended=?, activity='' WHERE id=?`, status, why, Date.now(), p.runId);
@@ -952,10 +1091,13 @@ export function serve() {
     return true;
   }
   function finishItem(id, by) {
-    const m = one(`SELECT handled, taken_by FROM messages WHERE id=?`, id);
-    if (!m || m.handled === 2) return;
+    const m = one(`SELECT handled, taken_by, target FROM messages WHERE id=?`, id);
+    if (!m || m.handled === 2 || m.target === 'all') return; // everyone answers for themselves
     run(`UPDATE messages SET handled=2, taken_by=COALESCE(taken_by, ?) WHERE id=?`, by, id);
-    for (const p of procs.values()) if (p.item?.id === id) p.item = null;
+    for (const p of procs.values()) {
+      if (p.item?.id === id) p.item = null;
+      if (p.directs) p.directs = p.directs.filter((x) => x.id !== id);
+    }
     audit(one(`SELECT room_id FROM messages WHERE id=?`, id).room_id, by, `resolved #${id}`);
   }
   const isFree = (p) => !p.item && !p.ended && one(`SELECT status FROM runs WHERE id=?`, p.runId)?.status === 'idle';
@@ -972,7 +1114,8 @@ export function serve() {
           continue;
         }
         p.item = { id: m.id, at: Date.now(), sawBusy: false };
-        writeTurn(p, `Message from your user in the group chat: ${m.body}\n(Message #${m.id}. You were free first, so it's yours and the others won't act on it. Do what you can, relay any part that belongs to someone else with @name, and post the outcome in the room.)`);
+        const crew = present(r.id).filter((x) => x.name !== p.agent).map((x) => `${x.name}: ${oneLine(x.doing || 'nothing noted').slice(0, 80)}`).join('; ') || 'nobody else';
+        writeTurn(p, `Message from your user in the group chat: ${m.body}\n(Message #${m.id}.${replyNote(m, p.agent)} You were free first, so it's yours and the others won't act on it. Who's on what: ${crew}. If it names another agent or belongs to their work, run: henchmen ${pathOf(r)} ${p.agent} pass ${m.id} @name, then end your turn with exactly (no reply). It goes straight to them, and do this even if you could answer from the chat. Otherwise do it and answer here yourself.)`);
         continue;
       }
       // Nobody started from the page is free: a session waiting in its own terminal can take it.
@@ -1022,7 +1165,7 @@ export function serve() {
       lines.push(`unread ${msgs.length}:`, ...msgs.map((m) => line(m, name)));
       return lines.join('\n');
     },
-    post(r, a, { kind, target, body }) {
+    post(r, a, { kind, target, body, reply }) {
       if (!KINDS.includes(kind)) throw new Refuse(400, `kind must be one of: ${KINDS.join(' ')}`);
       body = String(body ?? '').trim();
       const tail = !target && body.match(/(?:^|\s)@([a-z0-9][a-z0-9._-]{0,63})$/);
@@ -1030,8 +1173,14 @@ export function serve() {
       if (!body) throw new Refuse(400, 'empty message');
       capped(body, MAX_MESSAGE, 'message');
       if (words(body) > POST_WORDS) throw new Refuse(413, `REFUSED: that's ${words(body)} words, and posts stop at ${POST_WORDS}, because a person reads this room. Nothing was sent. Say the result first in plain short sentences. Put detail on a page with: detail NAME, and point to it.`);
+      if (target === 'everyone') target = 'all';
       if (target && !NAME.test(target)) throw new Refuse(400, `bad target: ${target}`);
-      const m = insert(r, a.name, target, kind, body);
+      const replied = reply && one(`SELECT * FROM messages WHERE room_id=? AND id=?`, r.id, Number(reply));
+      if (reply && !replied) throw new Refuse(404, `There's no message #${reply} in this room.`);
+      if (replied && !target && replied.sender !== 'human' && ownerOf(r, replied) !== a.name) target = ownerOf(r, replied);
+      // What an agent says while it has your message is its answer to that message.
+      const holding = !replied && (!target || target === 'human') && one(`SELECT id FROM messages WHERE room_id=? AND handled=1 AND taken_by=? ORDER BY id DESC LIMIT 1`, r.id, a.name);
+      const m = insert(r, a.name, target, kind, body, { reply_to: replied ? replied.id : holding?.id });
       if (!liveRun(r.id, a.name)) for (const it of q(`SELECT id FROM messages WHERE room_id=? AND handled=1 AND taken_by=?`, r.id, a.name)) finishItem(it.id, a.name);
       if (kind === 'done') {
         const mine = q(`SELECT * FROM tasks WHERE room_id=? AND owner=? AND status NOT IN ('done','finished')`, r.id, a.name);
@@ -1048,6 +1197,24 @@ export function serve() {
       if (!elsewhere) return `#${m.id} sent; ${target} isn't in this project right now and will see it on first sync here`;
       insert(elsewhere, a.name, target, kind, body, { copy: true, from_room: pathOf(r), source_id: m.id });
       return `#${m.id} sent to ${target} in ${pathOf(elsewhere)}`;
+    },
+    pass(r, a, { id, target }) {
+      target = String(target ?? '').replace(/^@/, '');
+      const m = one(`SELECT * FROM messages WHERE room_id=? AND id=? AND kind='human' AND handled IS NOT NULL`, r.id, Number(id));
+      if (!m) throw new Refuse(404, `#${id} isn't a message from the human that can be passed.`);
+      if (m.handled === 2) throw new Refuse(409, `#${id} is already finished.`);
+      if (m.taken_by !== a.name && !leads(r, a.name)) throw new Refuse(403, `${m.taken_by || 'Nobody'} has #${id}.`);
+      if (target === m.taken_by) throw new Refuse(400, `${target} already has #${id}.`);
+      if (!one(`SELECT 1 x FROM agents WHERE room_id=? AND name=? AND left_at IS NULL`, r.id, target)) throw new Refuse(404, `${target || 'That name'} isn't in this room. Here: ${present(r.id).map((x) => x.name).join(', ')}`);
+      if (m.passes >= MAX_PASSES) throw new Refuse(409, `REFUSED: #${id} has been passed ${MAX_PASSES} times already. Nothing changed. Handle it yourself, or ask your user.`);
+      run(`UPDATE messages SET passes=passes+1 WHERE id=?`, m.id);
+      for (const p of procs.values()) {
+        if (p.item?.id === m.id) p.item = null;
+        if (p.directs) p.directs = p.directs.filter((x) => x.id !== m.id);
+      }
+      audit(r.id, a.name, `passed #${id} to ${target}`);
+      handTo(r, m, target);
+      return `#${id} is ${target}'s now. Post nothing about it.`;
     },
     rename(r, a, { body }) {
       const next = String(body ?? '').trim();
@@ -1162,13 +1329,16 @@ export function serve() {
       const v = setSection(r, a.name, name, body ?? '', base);
       return v ? `section "${name}" saved as version ${v}` : `section "${name}" removed`;
     },
-    detail(r, a, { name, body }) {
+    detail(r, a, { name, body, show }) {
       name = scrub(name).trim().slice(0, 60);
-      if (!name) return q(`SELECT name FROM details WHERE room_id=?`, r.id).map((d) => d.name).join('\n') || 'no detail pages';
+      if (!name) return q(`SELECT name, shown FROM details WHERE room_id=?`, r.id).map((d) => (d.shown ? `${d.name} (on the human's report)` : d.name)).join('\n') || 'no detail pages';
       capped(body, MAX_DETAIL, 'detail page');
-      if (!String(body ?? '').trim()) return one(`SELECT body FROM details WHERE room_id=? AND name=?`, r.id, name)?.body ?? 'no such page';
-      run(`INSERT OR REPLACE INTO details(room_id, name, body, by, ts) VALUES(?,?,?,?,?)`, r.id, name, scrub(body), a.name, Date.now());
-      return `detail "${name}" saved`;
+      const text = String(body ?? '').trim();
+      if (!text && show === undefined) return one(`SELECT body FROM details WHERE room_id=? AND name=?`, r.id, name)?.body ?? 'no such page';
+      if (text) saveDetail(r.id, name, scrub(body), a.name);
+      if (show !== undefined) showDetail(r, name, show);
+      if (one(`SELECT shown FROM details WHERE room_id=? AND name=?`, r.id, name).shown) return `detail "${name}" ${text ? 'saved and ' : ''}is on the human's report`;
+      return text ? `detail "${name}" saved in the room's files, off the human's report. If the human should read it, run: detail "${name}" --show` : `detail "${name}" is off the human's report and stays in the room's files`;
     },
     resolve(r, a, { id }) {
       const item = one(`SELECT * FROM messages WHERE room_id=? AND id=? AND kind='human' AND handled IS NOT NULL`, r.id, Number(id));
@@ -1199,7 +1369,11 @@ export function serve() {
     },
     leave(r, a) {
       markLeft(r, a.name, true);
-      return 'left the room; your claims are released';
+      const p = liveRun(r.id, a.name);
+      if (!p?.window) return 'left the room; your claims are released';
+      // A window session would otherwise sit there running. The wait lets it finish this turn.
+      setTimeout(() => { if (procs.has(p.runId)) stopRun(p, 'It left the room'); }, 8000).unref();
+      return 'left the room; your claims are released, and your terminal closes shortly';
     },
     log(r, a, { n }) {
       const rows = q(`SELECT * FROM messages WHERE room_id=? ORDER BY id DESC LIMIT ?`, r.id, Math.min(Number(n) || 50, 1000));
@@ -1276,7 +1450,7 @@ export function serve() {
         const s = sectionsOf(k.id);
         return { id: k.id, slug: k.slug, leader: k.leader, live: subtree(k).reduce((n, x) => n + [...procs.values()].filter((p) => p.roomId === x.id).length, 0), needs: needsOf(k).length, agents: present(k.id).length, spend: spendOf(k), sections: [...s].sort((a, b) => b.ts - a.ts).map(({ name, body, version, by, ts }) => ({ name, body, version, by, ts })), version: s.reduce((n, x) => n + x.version, 0), ts: s.reduce((n, x) => Math.max(n, x.ts), 0) };
       }),
-      details: q(`SELECT name, by, ts FROM details WHERE room_id=? ORDER BY name`, r.id),
+      details: q(`SELECT name, by, ts, shown FROM details WHERE room_id=? ORDER BY name`, r.id),
       agents: q(`SELECT * FROM agents WHERE room_id=? AND cleared=0 ORDER BY left_at IS NOT NULL, seq`, r.id).map((a) => {
         const live = liveRun(r.id, a.name);
         const u = one(`SELECT * FROM runs WHERE room_id=? AND agent=? ORDER BY id DESC LIMIT 1`, r.id, a.name);
@@ -1286,7 +1460,9 @@ export function serve() {
       claims: q(`SELECT what, owner FROM claims WHERE root_id=? ORDER BY what`, rootOf(r).id),
       needs: needsOf(r),
       spend: spendOf(r),
-      messages: q(`SELECT id, sender, target, kind, body, ts, from_room, open, taken_by, handled FROM (SELECT * FROM messages WHERE room_id=? AND id>? ORDER BY id DESC LIMIT 100) ORDER BY id`, r.id, after),
+      compact_at: room(r.id).compact_at || 0,
+      contexts: Object.fromEntries([...procs.values()].filter((p) => p.roomId === r.id && p.context != null).map((p) => [p.agent, p.context])),
+      messages: q(`SELECT id, sender, target, kind, body, ts, from_room, open, taken_by, handled, reply_to, (SELECT sender FROM messages x WHERE x.id=m.reply_to) quote_sender, (SELECT substr(body, 1, 200) FROM messages x WHERE x.id=m.reply_to) quote_body FROM (SELECT * FROM messages WHERE room_id=? AND id>? ORDER BY id DESC LIMIT 100) m ORDER BY id`, r.id, after),
       newest: one(`SELECT COALESCE(MAX(id),0) id FROM messages WHERE room_id=?`, r.id).id,
       items: q(`SELECT id, handled, taken_by FROM messages WHERE room_id=? AND handled IS NOT NULL ORDER BY id DESC LIMIT 30`, r.id),
     };
@@ -1355,7 +1531,7 @@ export function serve() {
     for (const a of gone) {
       const released = q(`SELECT what FROM claims WHERE root_id=? AND owner=? AND room_id=?`, root, a.name, r.id).map((c) => c.what);
       const freed = q(`SELECT * FROM tasks WHERE room_id=? AND owner=? AND status IN ('open','doing','blocked','proposed') ORDER BY id`, r.id, a.name);
-      run(`INSERT OR REPLACE INTO details(room_id, name, body, by, ts) VALUES(?,?,?,?,?)`, r.id, `Handoff: ${a.name}`, handoffFor(r, a, released, freed), 'system', Date.now());
+      saveDetail(r.id, `Handoff: ${a.name}`, handoffFor(r, a, released, freed), 'system');
       run(`DELETE FROM claim_queue WHERE root_id=? AND agent=? AND room_id=?`, root, a.name, r.id);
       for (const what of released) freeClaim(root, what);
       run(`UPDATE tasks SET owner=NULL, status='open' WHERE room_id=? AND owner=? AND status IN ('open','doing','blocked','proposed')`, r.id, a.name);
@@ -1438,28 +1614,41 @@ export function serve() {
       }
       return { ok: true };
     },
-    say({ id, body, target }) {
+    say({ id, body, target, reply_to }) {
       const r = need(id);
       body = String(body ?? '').trim();
       const lead = !target && body.match(/^@([a-z0-9][a-z0-9._-]{0,63})\s+/);
       if (lead) { target = lead[1]; body = body.slice(lead[0].length); }
       if (!body) throw new Refuse(400, 'empty message');
       capped(body, MAX_MESSAGE, 'message');
-      if (target) {
-        const m = { room_id: r.id, sender: 'human', target, kind: 'human', body: scrub(body), ts: Date.now() };
-        m.id = Number(run(`INSERT INTO messages(room_id, sender, target, kind, body, ts) VALUES(?,?,?,?,?,?)`, r.id, 'human', target, 'human', m.body, m.ts).lastInsertRowid);
-        for (const w of [...waiters]) if (w.roomId === r.id && w.agent === target) w.deliver();
-        for (const p of procs.values()) {
-          if (p.roomId !== r.id || p.agent !== target) continue;
-          deliverToAgent(p, m);
-          if (p.window && !isSkillCall(r, m.body)) {
-            run(`UPDATE messages SET handled=1, taken_by=? WHERE id=?`, target, m.id);
-            (p.directs ??= []).push({ id: m.id, at: Date.now() });
-          }
+      if (target === 'everyone' || target === 'all') {
+        if (reply_to != null && !one(`SELECT 1 x FROM messages WHERE room_id=? AND id=?`, r.id, Number(reply_to))) throw new Refuse(404, `Message #${reply_to} isn't in this room, so nothing was sent.`);
+        // This room and every division under it, one copy each.
+        let first = null;
+        for (const x of subtree(r)) {
+          const m = { room_id: x.id, sender: 'human', target: 'all', kind: 'human', body: scrub(body), ts: Date.now(), reply_to: x.id === r.id && reply_to != null ? Number(reply_to) : null };
+          m.id = Number(run(`INSERT INTO messages(room_id, sender, target, kind, body, ts, reply_to) VALUES(?,?,?,?,?,?,?)`, x.id, 'human', 'all', 'human', m.body, m.ts, m.reply_to).lastInsertRowid);
+          first ??= m.id;
+          handTo(x, m, 'all');
         }
+        return { id: first };
+      }
+      const replied = reply_to != null && one(`SELECT * FROM messages WHERE room_id=? AND id=?`, r.id, Number(reply_to));
+      if (reply_to != null && !replied) throw new Refuse(404, `Message #${reply_to} isn't in this room, so nothing was sent.`);
+      target ||= ownerOf(r, replied);
+      // Naming one task sends the message to whoever has it.
+      const tasksNamed = [...new Set([...body.matchAll(/\b[Tt]asks? (\d+)\b/g)].map((x) => Number(x[1])))];
+      if (!target && tasksNamed.length === 1) {
+        const owner = one(`SELECT owner FROM tasks WHERE room_id=? AND id=? AND status<>'done'`, r.id, tasksNamed[0])?.owner;
+        if (owner && ownerOf(r, { sender: owner })) target = owner;
+      }
+      if (target) {
+        const m = { room_id: r.id, sender: 'human', target, kind: 'human', body: scrub(body), ts: Date.now(), reply_to: replied ? replied.id : null };
+        m.id = Number(run(`INSERT INTO messages(room_id, sender, target, kind, body, ts, reply_to) VALUES(?,?,?,?,?,?,?)`, r.id, 'human', target, 'human', m.body, m.ts, m.reply_to).lastInsertRowid);
+        handTo(r, m, target);
         return { id: m.id };
       }
-      const m = insert(r, 'human', null, 'human', body);
+      const m = insert(r, 'human', null, 'human', body, { reply_to: replied ? replied.id : null });
       run(`UPDATE messages SET handled=0 WHERE id=?`, m.id);
       dispatch();
       return { id: m.id };
@@ -1490,6 +1679,70 @@ export function serve() {
       stoppingAll = false;
       return { stopped: n };
     },
+    // Overrides everything under this room: work in progress, queued messages and open approvals.
+    // Each agent gets only this order, and nothing wakes anyone until your Keep going.
+    dropEverything({ id, body }) {
+      const r = need(id);
+      body = scrub(String(body ?? '').trim() || "Stop what you're doing and wait for me.");
+      capped(body, MAX_MESSAGE, 'message');
+      let interrupted = 0, told = 0;
+      for (const x of subtree(r)) {
+        audit(x.id, 'human', 'drop everything');
+        for (const a of q(`SELECT id FROM approvals WHERE room_id=? AND status='pending'`, x.id)) decide(a.id, 'deny', 'expired');
+        run(`UPDATE messages SET handled=3 WHERE room_id=? AND handled IN (0,1)`, x.id);
+        leaderNotes.delete(x.id);
+        run(`UPDATE rooms SET paused=1, pause_why=? WHERE id=?`, 'You pressed Drop everything. Agents do only what you told them, then wait. Press Keep going when they can go back to work.', x.id);
+        const m = { room_id: x.id, sender: 'human', target: 'all', kind: 'human', body, ts: Date.now() };
+        m.id = Number(run(`INSERT INTO messages(room_id, sender, target, kind, body, ts) VALUES(?,?,?,?,?,?)`, x.id, 'human', 'all', 'human', body, m.ts).lastInsertRowid);
+        const textFor = (name) => `Message from your user to the whole crew, and it overrides everything: ${body}\n(Message #${m.id}. You are ${name}. Your user pressed Drop everything. Whatever you were doing is on hold, including your plan, your tasks and anything you were asked before. Do only what this message asks of you, then end your turn. If it asks nothing of you, end your turn with exactly (no reply). Start nothing else until your user says so.)`;
+        for (const w of [...waiters]) if (w.roomId === x.id) { w.deliver(); told++; }
+        for (const p of procs.values()) {
+          if (p.roomId !== x.id) continue;
+          const busy = one(`SELECT status FROM runs WHERE id=?`, p.runId)?.status !== 'idle' || Date.now() - (p.freeSince ?? 0) < 5000;
+          p.heldTurns = [];
+          p.held = [];
+          run(`UPDATE agents SET cursor=MAX(cursor, ?) WHERE room_id=? AND name=?`, m.id, x.id, p.agent);
+          const entry = { id: m.id, at: Date.now(), shared: true };
+          const text = textFor(p.agent);
+          if (p.window) {
+            p.item = null;
+            p.directs = [entry];
+            if (busy && interruptWindow(p, text)) interrupted++;
+            else typeInto(p, text);
+          } else {
+            if (busy && p.child?.stdin.writable) {
+              p.child.stdin.write(JSON.stringify({ type: 'control_request', request_id: `drop-${m.id}-${p.runId}`, request: { subtype: 'interrupt' } }) + '\n');
+              interrupted++;
+            }
+            p.item = null;
+            p.directs = [entry];
+            writeTurn(p, text);
+          }
+          told++;
+        }
+      }
+      return { interrupted, told };
+    },
+    compact({ id, name }) {
+      const r = need(id);
+      const list = [...procs.values()].filter((p) => p.roomId === r.id && (!name || p.agent === name) && restingFor(p) >= 0);
+      for (const p of list) compactAgent(p);
+      return { compacted: list.length };
+    },
+    compactAt({ id, tokens }) {
+      const r = need(id);
+      run(`UPDATE rooms SET compact_at=? WHERE id=?`, Math.max(0, Math.floor(Number(tokens) || 0)), r.id);
+      audit(r.id, 'human', `compact limit ${tokens}`);
+      return { ok: true };
+    },
+    stopIdle({ id }) {
+      const r = need(id);
+      const idle = [...procs.values()].filter((p) => p.roomId === r.id && p.agent !== room(r.id).leader && !p.item && !p.directs?.length && one(`SELECT status FROM runs WHERE id=?`, p.runId)?.status === 'idle' && Date.now() - (p.freeSince ?? p.born ?? 0) >= IDLE_MS);
+      stoppingAll = true;
+      for (const p of idle) stopRun(p, 'Idle, stopped from the page');
+      stoppingAll = false;
+      return { stopped: idle.length };
+    },
     ack({ id }) {
       run(`UPDATE runs SET acked=1 WHERE id=?`, Number(id));
       return { ok: true };
@@ -1507,7 +1760,12 @@ export function serve() {
     resume({ id }) {
       const r = need(id);
       run(`UPDATE rooms SET paused=0, wakes=0, pause_why=NULL, goal_met=NULL WHERE id=?`, r.id);
-      insert(r, 'system', null, 'note', 'Resumed.');
+      if (/^You pressed Drop everything/.test(r.pause_why ?? '')) {
+        // In your name, because agents rightly don't take orders from a room note.
+        const m = { room_id: r.id, sender: 'human', target: 'all', kind: 'human', body: 'Keep going. Go back to the work you had before Drop everything.', ts: Date.now() };
+        m.id = Number(run(`INSERT INTO messages(room_id, sender, target, kind, body, ts) VALUES(?,?,?,?,?,?)`, r.id, 'human', 'all', 'human', m.body, m.ts).lastInsertRowid);
+        handTo(r, m, 'all');
+      } else insert(r, 'system', null, 'note', 'Resumed.');
       for (const w of [...waiters]) if (w.roomId === r.id && hasAddressedUnread(r, w.agent)) w.deliver();
       for (const p of procs.values()) if (p.roomId === r.id) for (const m of p.held?.splice(0) ?? []) deliverToAgent(p, m);
       return { ok: true };
@@ -1519,8 +1777,19 @@ export function serve() {
     report({ id, name, body, base }) { return { version: setSection(need(id), 'human', name, body ?? '', base) }; },
     detail({ id, name, body }) {
       capped(body, MAX_DETAIL, 'detail page');
-      run(`INSERT OR REPLACE INTO details(room_id, name, body, by, ts) VALUES(?,?,?,?,?)`, need(id).id, scrub(name).trim().slice(0, 60), scrub(body), 'human', Date.now());
+      saveDetail(need(id).id, scrub(name).trim().slice(0, 60), scrub(body), 'human');
       return { ok: true };
+    },
+    detailShown({ id, name, shown }) {
+      showDetail(need(id), name, !!shown);
+      return { ok: true };
+    },
+    // One page by name, or with no name every page that isn't on the report.
+    deleteDetails({ id, name }) {
+      const r = need(id);
+      audit(r.id, 'human', `delete pages ${name ?? '(all off the report)'}`);
+      const res = name ? run(`DELETE FROM details WHERE room_id=? AND name=?`, r.id, name) : run(`DELETE FROM details WHERE room_id=? AND shown=0`, r.id);
+      return { deleted: Number(res.changes) };
     },
     task({ id, task_id, title, owner, status }) {
       const r = need(id);
@@ -1608,13 +1877,19 @@ export function serve() {
             const r = need(parts[2]);
             if (parts[3] === 'older') {
               const before = Number(url.searchParams.get('before')) || 2 ** 53;
-              return json(200, { messages: q(`SELECT id, sender, target, kind, body, ts, from_room, open, taken_by, handled FROM (SELECT * FROM messages WHERE room_id=? AND id<? ORDER BY id DESC LIMIT 60) ORDER BY id`, r.id, before) });
+              return json(200, { messages: q(`SELECT id, sender, target, kind, body, ts, from_room, open, taken_by, handled, reply_to, (SELECT sender FROM messages x WHERE x.id=m.reply_to) quote_sender, (SELECT substr(body, 1, 200) FROM messages x WHERE x.id=m.reply_to) quote_body FROM (SELECT * FROM messages WHERE room_id=? AND id<? ORDER BY id DESC LIMIT 60) m ORDER BY id`, r.id, before) });
             }
             if (parts[3] === 'skills') {
               if (!isOwner(req)) throw new Refuse(403, 'forbidden');
               return json(200, { skills: skillsFor(r) });
             }
-            if (parts[3] === 'detail') return json(200, one(`SELECT name, body, by, ts FROM details WHERE room_id=? AND name=?`, r.id, url.searchParams.get('name')) || {});
+            if (parts[3] === 'search') {
+              const text = String(url.searchParams.get('q') ?? '').trim();
+              if (!text) return json(200, { results: [] });
+              const like = `%${text.replace(/[\\%_]/g, (c) => `\\${c}`)}%`;
+              return json(200, { results: q(`SELECT id, sender, ts, substr(body, 1, 160) body FROM messages WHERE room_id=? AND body LIKE ? ESCAPE '\\' ORDER BY id DESC LIMIT 40`, r.id, like) });
+            }
+            if (parts[3] === 'detail') return json(200, one(`SELECT name, body, by, ts, shown FROM details WHERE room_id=? AND name=?`, r.id, url.searchParams.get('name')) || {});
             return json(200, { owner: isOwner(req), ...roomView(r, Number(url.searchParams.get('after')) || 0) });
           }
           throw new Refuse(404, 'not found');

@@ -46,7 +46,7 @@ To keep things moving later, type in the page's group chat, or say "continue" to
 ## What's on the page
 
 - **Report:** one page, replaced live. Whatever changed since you last looked is marked. A division's report shows up on its parent's page.
-- **Discussion:** the agents' group chat. A message goes to whoever is free first: that agent handles it or relays it, the leader hears when next free, and the others don't repeat it. Your message shows who has it. Use `@name` for one agent. Agents write short and plain: a post over 80 words is refused, and detail goes on a linked page.
+- **Discussion:** texting with your crew. Hover any message and press **Reply**, and it goes straight to whoever wrote it, with the original quoted above your text. Click the quote to jump back. A message with no name goes to whoever's free. Naming one task sends it to that task's owner. Use `@name` for anyone else. An agent that finds the work is someone else's passes it straight to them, so nothing gets relayed. Agents write short and plain: a post over 80 words is refused, and detail goes on a linked page.
 - **The post in the middle:** your crew. The agent on top leads. Click one to see its task and spending, stop it, or open **Talk to agent**.
 - **The yellow band:** what needs you: permission requests, blockers and questions, from this room and its divisions.
 
@@ -68,6 +68,10 @@ Typing `/` in the task or the group chat offers your skills, and they run the wa
 - **Leader:** the first agent in a room leads and manages its tasks. If the leader leaves, the agent that's been there longest takes over.
 - **Claims:** an agent claims a file or task before changing it. A claim holds across the whole project, so two divisions can't collide on a file.
 - **Default instructions:** every agent gets them when it joins. Edit them per room in Room settings; divisions inherit from their parent.
+- **@everyone and Drop everything:** `@everyone` sends a message to every agent here and in the divisions below, and each does its own part. **Drop everything**, under the crew, is the override: after a small confirmation at the top of the page, it interrupts every agent mid-work, cancels queued messages and open approvals, and gives each agent only what you typed. The room then waits for your **Keep going**.
+- **Room actions:** find any message in the chat, ask the leader to catch you up, and see how much each agent is carrying. You can compact an agent's memory by hand, or have resting agents compact when they pass a limit you pick. It's off by default, because compacting loses some detail.
+- **Tabs close themselves:** when an agent finishes, leaves or is stopped, its Terminal tab closes. A tab only closes if it has nothing running and still has the agent's title, so your own tabs are safe. A crashed agent keeps its tab so you can read why. **Stop idle** ends agents that have sat idle for a minute, except the leader.
+- **Agents' files:** pages agents write stay in Room settings, where you can read or delete them. Only pages an agent marks for you (`detail NAME --show`), 8 at most, appear on the report.
 - **Reports stay short:** an edit based on an old version is refused and returned with the current text, so nothing gets overwritten. A report that won't fit one page is refused, and the detail goes on a linked page.
 
 ## Security levels

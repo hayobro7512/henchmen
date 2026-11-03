@@ -471,11 +471,13 @@ function buildRoom() {
   E.crewList = h('ul', { class: 'crew', 'aria-label': 'Crew' });
   E.clearGone = h('button', { class: 'stop-all clear-gone', type: 'button', hidden: true, disabled: !R.owner, title: 'Clear agents who are gone, leaving a handoff for each', onclick: openClearGone }, 'Clear gone');
   E.stopAll = h('button', { class: 'stop-all', type: 'button', hidden: true, disabled: !R.owner, title: 'Stop every agent running in this room and its divisions', onclick: stopAll }, 'Stop all');
+  E.stopIdle = h('button', { class: 'stop-all clear-gone', type: 'button', hidden: true, disabled: !R.owner, title: 'Stop agents that have sat idle for a minute and close their tabs. The leader stays.', onclick: stopIdle });
+  E.dropBtn = h('button', { class: 'stop-all drop', type: 'button', hidden: true, disabled: !R.owner, title: 'Interrupt every agent here and in the divisions below', onclick: openDrop }, 'Drop everything');
   E.rail = h('div', { class: 'rail' },
     h('div', { class: 'rail-handle', role: 'separator', tabindex: '0', 'aria-orientation': 'vertical', 'aria-label': 'Resize panels. Use the left and right arrow keys.', 'aria-valuemin': '25', 'aria-valuemax': '75', 'aria-valuenow': '50', onpointerdown: startDrag, onkeydown: dragKeys }),
     h('h2', { class: 'rail-head' }, 'On the payroll'),
     E.crewList,
-    h('div', { class: 'rail-foot' }, E.clearGone, E.stopAll));
+    h('div', { class: 'rail-foot' }, E.clearGone, E.stopIdle, E.stopAll, E.dropBtn));
   E.split = h('main', { class: 'split' }, E.report, E.rail, E.disc);
   E.pop = h('div', { class: 'pop', role: 'dialog', 'aria-label': 'Agent', hidden: true });
   E.viewPop = h('div', { class: 'pop', role: 'dialog', 'aria-label': 'View', hidden: true });
@@ -489,6 +491,7 @@ function buildRoom() {
       h('a', { class: 'brand', href: '/', title: 'All projects', 'aria-label': 'Henchmen, all projects' }, h('img', { src: '/logo.svg', alt: '', width: '30', height: '30' }), h('span', {}, 'Henchmen')),
       E.crumbs, E.lead, E.fullAccess,
       h('div', { class: 'actions' }, E.spend, E.tasksBtn, E.startBtn, E.viewBtn,
+        h('button', { class: 'btn', type: 'button', onclick: openActions }, 'Room actions'),
         h('button', { class: 'btn', type: 'button', onclick: openSettings }, 'Room settings'))),
     banner,
     h('div', { class: 'notice', hidden: R.owner }, 'View only. ', takeControlButton(), ' or run ', h('code', {}, 'henchmen open'), '.'),
@@ -683,7 +686,11 @@ function renderCrew(v) {
   });
   place(E.crewList, els);
   E.stopAll.hidden = !v.agents.some((a) => a.live) && !v.rollups.some((r) => r.live > 0);
+  E.dropBtn.hidden = E.stopAll.hidden;
   E.clearGone.hidden = !v.agents.some((a) => !a.here && !a.live);
+  const idle = v.agents.filter((a) => a.live && a.run?.status === 'idle' && a.name !== v.room.leader && !v.items.some((x) => x.handled === 1 && x.taken_by === a.name)).length;
+  E.stopIdle.hidden = !idle;
+  E.stopIdle.textContent = `Stop idle (${idle})`;
   if (R.popAgent) {
     const a = v.agents.find((x) => x.name === R.popAgent);
     if (!a) closePop(); else if (popEl === E.pop) fillPop(a);
@@ -727,6 +734,7 @@ function fillPop(a) {
   if (page || win) {
     if (!inTerminal && !win) rows.push(['Doing now', a.run.activity || (a.live ? 'Nothing right now' : 'Stopped')]);
     if (!win) rows.push(['Spend', `${a.run.cost_known ? `${money(a.run.cost)} of` : 'Not reported;'} ${money(a.run.cap)} cap`]); // a window agent's spend isn't known
+    if (a.live && R.v.contexts?.[a.name] != null) rows.push(['Memory', tokensText(R.v.contexts[a.name])]);
     rows.push(['Model', a.run.model || 'Your default']);
     if (a.run.effort) rows.push(['Effort', EFFORTS[a.run.effort] || a.run.effort]);
     if (a.run.why && !a.live) rows.push(['Why it stopped', a.run.why]);
@@ -745,6 +753,14 @@ function fillPop(a) {
       if (!t.opened) E.pop.querySelector('.command button')?.focus();
     }));
   }
+  const message = a.here && h('button', { class: 'btn', type: 'button', ...owned, onclick: () => {
+    closePop();
+    R.popAgent = null;
+    setReply(null);
+    E.input.value = `@${a.name} `;
+    sizeInput();
+    E.input.focus();
+  } }, `Message ${a.name}`);
   const stop = a.live && h('button', { class: 'btn danger', type: 'button', ...owned }, `Stop ${a.name}`);
   if (stop) stop.addEventListener('click', () => run(stop, async () => { await act('stop', { id: R.id, name: a.name }); closePop(); R.popAgent = null; tick(); }));
   // This redraws while open, so the button in use keeps focus.
@@ -755,7 +771,7 @@ function fillPop(a) {
     ...(inTerminal ? [h('p', { class: 'pop-note' }, "It's in a full terminal session with you. Messages sent now are held and delivered when it returns.")] : []),
     ...(win && a.live ? [h('p', { class: 'pop-note' }, "Runs in its own terminal window on your plan. Room messages are typed into it; they wait while it's asking you something.")] : []),
     ...(a.here && a.source === 'terminal' ? [h('p', { class: 'pop-note' }, 'This session runs in your own terminal.')] : []),
-    ...(a.live ? [h('div', { class: 'pop-actions' }, talk, stop)] : []),
+    ...(a.live || a.here ? [h('div', { class: 'pop-actions' }, message, talk, stop)] : []),
     ...(command ? [commandBox(command)] : []));
   if (focused) [...E.pop.querySelectorAll('button')].find((b) => b.textContent === focused)?.focus();
   if (popEl === E.pop) E.pop.style.top = `${Math.max(12, Math.min(parseFloat(E.pop.style.top), innerHeight - E.pop.offsetHeight - 12))}px`;
@@ -770,23 +786,59 @@ function openClearGone() {
       btn.addEventListener('click', () => run(btn, async () => {
         const { cleared } = await act('clearGone', { id: R.id });
         d.close();
-        toast(`Cleared ${plural(cleared.length, 'agent')}. Each left a handoff in the report.`);
+        toast(`Cleared ${plural(cleared.length, 'agent')}. Each left a handoff in Agents' files.`);
         tick();
       }, err));
       body.append(
-        h('p', {}, 'Each one leaves the crew and gets a handoff page in this report, built from its status, tasks, commits and latest messages. Its files, messages and chat history stay.'),
+        h('p', {}, "Each one leaves the crew and gets a handoff page in Agents' files, built from its status, tasks, commits and latest messages. Its files, messages and chat history stay."),
         h('ul', { class: 'gone-list' }, gone.map((a) => h('li', {}, h('strong', {}, a.name), a.doing ? `: ${a.doing}` : ''))),
         h('p', { class: 'hint' }, "Unfinished tasks become unassigned and claims are released. This doesn't close any terminal: a silent session can look gone, and it rejoins by syncing under its name."),
         err, h('div', { class: 'row' }, btn));
     },
   });
 }
-function openHandoffs(list) {
+// Everything agents keep for themselves, away from the report. Deleting can't be undone, so the first click only asks.
+function openFiles() {
   openDialog({
-    title: 'Handoffs', cls: 'center',
+    title: "Agents' files", cls: 'center',
     build: (body, d) => {
-      body.append(h('ul', { class: 'gone-list' }, list.map((x) => h('li', {}, h('button', { class: 'text-btn', type: 'button', onclick: () => { d.close(); openDetail(x.name); } }, x.name.replace(/^Handoff: /, ''))))));
+      const list = R.v.details.filter((x) => !x.shown).sort((a, b) => b.ts - a.ts);
+      const err = h('p', { class: 'err', role: 'alert' });
+      const del = (label, sure, name) => {
+        const b = h('button', {
+          class: 'btn', type: 'button', disabled: !R.owner,
+          onclick: () => {
+            if (!b.dataset.sure) { b.dataset.sure = '1'; b.textContent = sure; b.classList.add('danger'); return; }
+            run(b, async () => {
+              await act('deleteDetails', { id: R.id, name });
+              list.splice(0, list.length, ...(name ? list.filter((x) => x.name !== name) : []));
+              draw();
+              tick();
+            }, err);
+          },
+        }, label);
+        return b;
+      };
+      const draw = () => {
+        if (!list.length) { body.replaceChildren(h('p', {}, "No files. Pages agents write for their own work land here, off your report.")); return; }
+        body.replaceChildren(
+          h('p', {}, "Pages agents wrote for their own work. They aren't on your report. A deleted page can't be brought back, and an agent still working from it loses it."),
+          h('div', { class: 'row' }, del(`Delete all ${list.length}`, `Yes, delete all ${list.length}`)),
+          err,
+          h('ul', { class: 'file-list' }, list.map((x) => h('li', {},
+            h('button', { class: 'text-btn', type: 'button', onclick: () => { d.close(); openDetail(x.name); } }, x.name),
+            h('span', { class: 'hint' }, `${x.by === 'human' ? 'you' : x.by}, ${ago(x.ts)}`),
+            del('Delete', 'Yes, delete', x.name)))));
+      };
+      draw();
     },
+  });
+}
+function stopIdle(e) {
+  run(e.target, async () => {
+    const { stopped } = await act('stopIdle', { id: R.id });
+    toast(stopped ? `Stopped ${plural(stopped, 'idle agent')}.` : "Nobody has been idle for a minute yet, so nobody was stopped.");
+    tick();
   });
 }
 function stopAll(e) {
@@ -971,19 +1023,18 @@ function renderReport(v) {
   E.rollups.hidden = !rollEls.length;
   if (firstEver || R.first) saveSeen();
 
-  E.details.hidden = !v.details.length;
-  const detailSig = JSON.stringify(v.details.map((d) => d.name));
+  const shownPages = v.details.filter((d) => d.shown);
+  E.details.hidden = !shownPages.length;
+  const detailSig = JSON.stringify(shownPages.map((d) => d.name));
   if (detailSig !== E.detailSig) {
     E.detailSig = detailSig;
-    // Handoffs collapse into one link, so clearing a crew doesn't crowd the one-page report.
-    const handoffs = v.details.filter((d) => d.name.startsWith('Handoff: '));
-    const pages = v.details.filter((d) => !d.name.startsWith('Handoff: '));
-    E.details.replaceChildren(h('span', {}, 'Detail pages:'), ...pages.map((d) => h('button', { class: 'text-btn', type: 'button', onclick: () => openDetail(d.name) }, d.name)), ...(handoffs.length ? [h('button', { class: 'text-btn', type: 'button', onclick: () => openHandoffs(handoffs) }, `Handoffs (${handoffs.length})`)] : []));
+    E.details.replaceChildren(h('span', {}, 'More reports:'), ...shownPages.map((d) => h('button', { class: 'text-btn', type: 'button', onclick: () => openDetail(d.name) }, d.name)));
   }
   E.words.textContent = `${v.words} of ${v.word_limit} words`;
   updateItems(v.items);
+  drawTyping(v);
 
-  const blank = !v.sections.length && !v.rollups.length && !v.details.length;
+  const blank = !v.sections.length && !v.rollups.length && !shownPages.length;
   E.emptyReport.hidden = !blank;
   if (blank) {
     const sig = `${v.room.path}\n${v.room.brief}`;
@@ -1102,14 +1153,24 @@ function openAddSection() {
 function openDetail(name) {
   openDialog({
     title: name, cls: 'sheet',
-    build: (body) => {
+    build: (body, dlg) => {
       const box = h('div', { class: 'md' }, 'Loading');
       const meta = h('p', { class: 'hint' });
-      body.append(box, meta);
+      const err = h('p', { class: 'err', role: 'alert' });
+      const flip = h('button', { class: 'btn', type: 'button', hidden: true, disabled: !R.owner });
+      body.append(box, meta, err, h('div', { class: 'row' }, flip));
       getJSON(`/api/room/${R.id}/detail?name=${encodeURIComponent(name)}`).then((d) => {
         if (d.body == null) { box.textContent = "This page isn't there anymore."; return; }
         box.innerHTML = markdown(d.body);
         meta.textContent = `Updated ${ago(d.ts)} by ${d.by === 'human' ? 'you' : d.by}`;
+        flip.hidden = false;
+        flip.textContent = d.shown ? "Move to Agents' files" : 'Put on the report';
+        flip.onclick = () => run(flip, async () => {
+          await act('detailShown', { id: R.id, name, shown: !d.shown });
+          dlg.close();
+          toast(d.shown ? `Moved ${name} to Agents' files.` : `Put ${name} on the report.`);
+          tick();
+        }, err);
       }, () => { box.textContent = "Couldn't load this page. Check that Henchmen is running: henchmen list"; });
     },
   });
@@ -1120,20 +1181,130 @@ function buildComposer() {
   const E = R.el;
   E.input = h('textarea', {
     rows: 1, 'aria-label': 'Message', disabled: !R.owner,
-    placeholder: R.owner ? 'Message the room. @name for one agent, /skill to run a skill.' : VIEW_ONLY,
+    placeholder: R.owner ? 'Tell your crew what to do. @name picks one, /skill runs a skill.' : VIEW_ONLY,
     oninput: sizeInput,
     onkeydown: composerKeys,
   });
   E.menu = inputMenu(E.input, composerOptions);
   E.sendErr = h('p', { class: 'err', role: 'alert' });
   E.sendBtn = h('button', { class: 'btn primary', type: 'submit', disabled: !R.owner }, 'Send');
-  return h('form', { class: 'composer', onsubmit: (e) => { e.preventDefault(); send(); } }, E.menu.el,
+  E.typing = h('div', { class: 'typing', 'aria-live': 'polite' });
+  E.replyBar = h('div', { class: 'reply-bar', hidden: true });
+  return h('form', { class: 'composer', onsubmit: (e) => { e.preventDefault(); send(); } }, E.menu.el, E.typing, E.replyBar,
     h('div', { class: 'composer-row' }, E.input, E.sendBtn), E.sendErr);
+}
+// Asks first, in a small box at the top, because this interrupts everyone at once.
+function openDrop() {
+  const n = R.v.agents.filter((a) => a.live).length + R.v.rollups.reduce((sum, r) => sum + (r.live || 0), 0);
+  openDialog({
+    title: 'Drop everything?', cls: 'top-confirm',
+    build: (body, d) => {
+      const order = h('textarea', { rows: 2, 'aria-label': 'What should they do instead?', placeholder: "What should they do instead? Blank means stop and wait for you." });
+      const err = h('p', { class: 'err', role: 'alert' });
+      const go = h('button', { class: 'btn danger', type: 'submit' }, 'Drop everything');
+      body.append(h('form', { onsubmit: (e) => {
+        e.preventDefault();
+        run(go, async () => {
+          const { interrupted, told } = await act('dropEverything', { id: R.id, body: order.value });
+          d.close();
+          R.stick = true;
+          toast(`Interrupted ${plural(interrupted, 'agent')}, and told ${told} to wait for you. Press Keep going when they can go back to work.`);
+          tick();
+        }, err);
+      } },
+      h('p', {}, `This interrupts ${plural(n, 'agent')}, cancels queued messages and open approvals, and holds the room until you press Keep going.`),
+      order, err,
+      h('div', { class: 'row top-confirm-actions' }, h('button', { class: 'btn', type: 'button', onclick: () => d.close() }, 'Go back'), go)));
+      queueMicrotask(() => order.focus()); // once the dialog is open
+    },
+  });
+}
+const tokensText = (n) => (n == null ? 'Not measured yet' : n < 1000 ? 'Just compacted' : `About ${Math.round(n / 1000)}k tokens`);
+function openActions() {
+  const v = R.v;
+  openDialog({
+    title: 'Room actions',
+    build: (body, d) => {
+      // Find in chat
+      const results = h('ul', { class: 'file-list' });
+      const note = h('p', { class: 'hint', role: 'status' });
+      let timer;
+      const search = h('input', { type: 'search', 'aria-label': 'Find in chat', placeholder: 'Words from any message', oninput: () => {
+        clearTimeout(timer);
+        timer = setTimeout(async () => {
+          const text = search.value.trim();
+          const { results: found } = text ? await getJSON(`/api/room/${R.id}/search?q=${encodeURIComponent(text)}`) : { results: [] };
+          if (search.value.trim() !== text) return;
+          note.textContent = text ? (found.length ? (found.length === 40 ? 'The newest 40 matches.' : `${plural(found.length, 'match', 'matches')}.`) : 'No message has those words.') : '';
+          results.replaceChildren(...found.map((m) => h('li', {},
+            h('button', { class: 'text-btn', type: 'button', onclick: () => { d.close(); jumpToMsg(m.id); } }, `#${m.id} ${whoName(m.sender)}`),
+            h('span', { class: 'hint' }, `${clock(m.ts)}: ${m.body}`))));
+        }, 250);
+      } });
+      // Catch me up
+      const leader = v.leader;
+      const catchUp = h('button', { class: 'btn', type: 'button', disabled: !R.owner || !leader, onclick: () => run(catchUp, async () => {
+        await act('say', { id: R.id, target: leader, body: `Catch me up in under 80 words: what changed since #${R.seenId ?? 0}, what's finished, what's stuck, and what you need from me.` });
+        d.close();
+        R.stick = true;
+        tick();
+      }) }, leader ? `Ask ${leader} to catch me up` : 'No leader here yet');
+      // Agent memory
+      const live = v.agents.filter((a) => a.live);
+      const err = h('p', { class: 'err', role: 'alert' });
+      const said = h('p', { class: 'hint', role: 'status' });
+      const compact = (btn, name) => run(btn, async () => {
+        const { compacted } = await act('compact', { id: R.id, name });
+        said.textContent = compacted ? `Compacting ${plural(compacted, 'agent')}. It takes a minute or two.` : 'Only resting agents can compact. Try again when it has finished its turn.';
+        tick();
+      }, err);
+      const limit = h('select', { 'aria-label': 'Compact automatically', disabled: !R.owner, onchange: () => run(null, () => act('compactAt', { id: R.id, tokens: Number(limit.value) }), err) },
+        h('option', { value: '0' }, 'Off: Claude Code decides'), ...[150, 250, 400].map((k) => h('option', { value: String(k * 1000) }, `When a resting agent passes ${k}k tokens`)));
+      limit.value = String(v.compact_at || 0);
+      body.append(
+        h('div', { class: 'dlg-group' }, h('h3', {}, 'Find in chat'), search, note, results),
+        h('div', { class: 'dlg-group' }, h('h3', {}, 'Catch me up'), h('span', { class: 'hint' }, 'Sends the leader a message asking what changed since you last looked.'), h('div', { class: 'row' }, catchUp)),
+        h('div', { class: 'dlg-group' }, h('h3', {}, 'Agent memory'),
+          h('span', { class: 'hint' }, 'What each agent re-reads on every turn. Compacting replaces it with a summary, so turns cost less but some detail is lost. Your chat stays as it is.'),
+          live.length ? h('ul', { class: 'file-list' }, live.map((a) => {
+            const b = h('button', { class: 'btn', type: 'button', disabled: !R.owner, onclick: () => compact(b, a.name) }, 'Compact');
+            return h('li', {}, h('strong', {}, a.name), h('span', { class: 'hint' }, tokensText(v.contexts?.[a.name])), b);
+          })) : h('p', { class: 'hint' }, 'No agents are running.'),
+          err, said,
+          live.length > 1 && h('div', { class: 'row' }, (() => { const b = h('button', { class: 'btn', type: 'button', disabled: !R.owner, onclick: () => compact(b) }, 'Compact all resting agents'); return b; })()),
+          h('label', { class: 'field' }, 'Compact automatically', limit)));
+      queueMicrotask(() => search.focus());
+    },
+  });
 }
 function sizeInput() {
   const t = R.el.input;
   t.style.height = 'auto';
   t.style.height = `${t.scrollHeight + 2}px`;
+}
+const whoName = (sender) => (sender === 'human' ? 'You' : sender === 'system' ? 'Henchmen' : sender);
+const quoteNodes = (sender, body) => [h('strong', {}, whoName(sender)), h('span', { class: 'quote-text' }, String(body))];
+// Keeps the newest message in view when something above the input box appears or goes.
+function composerChanged() { if (R.stick) scrollChatEnd(); }
+function setReply(m) {
+  const E = R.el;
+  R.reply = m;
+  E.replyBar.hidden = !m;
+  E.replyBar.replaceChildren(...(m ? [
+    h('div', { class: 'reply-to' }, h('strong', {}, `Replying to ${m.sender === 'human' ? 'yourself' : whoName(m.sender)}`), h('span', { class: 'quote-text' }, String(m.body))),
+    h('button', { class: 'text-btn', type: 'button', 'aria-label': 'Stop replying', onclick: () => { setReply(null); E.input.focus(); } }, 'Cancel'),
+  ] : []));
+  composerChanged();
+  if (m) E.input.focus();
+}
+function drawTyping(v) {
+  const E = R.el;
+  const busy = [...new Set((v.items || []).filter((x) => x.handled === 1).map((x) => x.taken_by))].filter((n) => v.agents.some((a) => a.name === n && a.live && a.run?.status !== 'waiting')); // a window's status lags, but an open message means it has it
+  const text = !busy.length ? '' : busy.length === 1 ? `${busy[0]} is working on your message` : `${busy.slice(0, -1).join(', ')} and ${busy.at(-1)} are working on your messages`;
+  if (E.typing.dataset.text === text) return;
+  E.typing.dataset.text = text;
+  E.typing.replaceChildren(...(text ? [text, h('span', { class: 'dots', 'aria-hidden': 'true' }, h('i'), h('i'), h('i'))] : []));
+  composerChanged();
 }
 function send() {
   const E = R.el;
@@ -1143,10 +1314,14 @@ function send() {
   const skillFor = body.match(/^\s*@([a-z0-9][a-z0-9._-]*)\s+(\/[\s\S]*)$/);
   // One known @name anywhere goes to that agent; several go to everyone, where each still sees their name.
   const names = new Set([...body.matchAll(/(?:^|\s)@([a-z0-9][a-z0-9._-]*)/g)].map((m) => m[1]).filter((n) => R.v.agents.some((a) => a.here && a.name === n)));
-  const target = names.size === 1 && !body.startsWith('@') && !body.startsWith('/') ? [...names][0] : undefined; // the server takes a leading @name itself
+  const named = names.size === 1 && !body.startsWith('@') && !body.startsWith('/') ? [...names][0] : undefined; // the server takes a leading @name itself
+  const everyone = /(?:^|\s)@everyone(?:\s|$)/.test(body) && !body.startsWith('@'); // the server takes a leading one itself
+  const target = everyone ? 'everyone' : named;
+  const reply_to = R.reply && !body.trimStart().startsWith('/') ? R.reply.id : undefined;
   run(E.sendBtn, async () => {
-    await act('say', skillFor ? { id: R.id, body: skillFor[2], target: skillFor[1] } : { id: R.id, body, target });
+    await act('say', skillFor ? { id: R.id, body: skillFor[2], target: skillFor[1] } : { id: R.id, body, target, reply_to });
     E.input.value = '';
+    setReply(null);
     sizeInput();
     E.menu.hide();
     R.stick = true;
@@ -1155,6 +1330,7 @@ function send() {
 }
 function composerKeys(e) {
   if (R.el.menu.keys(e)) return;
+  if (e.key === 'Escape' && R.reply) { setReply(null); return; }
   // isComposing: Enter confirms an IME candidate, it doesn't send.
   if (e.key === 'Enter' && !e.shiftKey && !e.isComposing && e.keyCode !== 229) { e.preventDefault(); send(); }
 }
@@ -1215,7 +1391,9 @@ function composerOptions(before, reload) {
   const at = before.match(/(?:^|\s)@([a-z0-9._-]*)$/);
   if (at) {
     const here = R.v.agents.filter((a) => a.here && a.name.startsWith(at[1]));
-    return here.length ? { start: before.length - at[1].length, options: here.map((a) => ({ insert: a.name, nodes: [badge(a.name), a.name] })) } : null;
+    const all = 'everyone'.startsWith(at[1]) ? [{ insert: 'everyone', nodes: [badge('everyone'), 'everyone', h('span', { class: 'menu-desc' }, 'the whole crew')] }] : [];
+    const options = [...all, ...here.map((a) => ({ insert: a.name, nodes: [badge(a.name), a.name] }))];
+    return options.length ? { start: before.length - at[1].length, options } : null;
   }
   const skill = before.match(/^@([a-z0-9][a-z0-9._-]*)\s+\/(\S*)$/) || before.match(/^()\/(\S*)$/);
   if (!skill) return null;
@@ -1252,7 +1430,7 @@ function skillOptions(before, query, reload, hint) {
 
 const showsInChat = (m) => (m.sender === 'human' ? true : m.sender === 'system' ? R.filters.system : R.filters[m.kind] !== false);
 const sameRun = (a, b) => a && a.sender === b.sender && a.sender !== 'system' && a.from_room === b.from_room && a.target === b.target && b.ts - a.ts < 300000 && !TAGS[b.kind] && !TAGS[a.kind];
-const itemWords = (x) => (x.handled === 2 ? `Handled by ${x.taken_by}` : x.handled === 1 ? `${x.taken_by} has this` : 'Waiting for a free agent');
+const itemWords = (x) => (x.handled === 3 ? 'Dropped' : x.handled === 2 ? `${x.taken_by} finished` : x.handled === 1 ? `${x.taken_by} is on it` : 'Waiting for someone free');
 function updateItems(items) {
   for (const x of items || []) {
     const el = document.querySelector(`[data-item="${Number(x.id)}"]`);
@@ -1275,38 +1453,53 @@ async function jumpToMsg(id) {
   for (let i = 0; i < 25 && !find() && !R.exhausted; i++) await loadOlder();
   const el = find();
   if (!el) { toast(`Message #${id} isn't in this room.`); return; }
-  el.querySelector('.bubble.clamped')?.classList.remove('clamped');
+  el.querySelector('.bubble-text.clamped')?.classList.remove('clamped');
   el.scrollIntoView({ block: 'center' });
   el.classList.add('flash');
   setTimeout(() => el.classList.remove('flash'), 2000);
 }
+const replyBtn = (m) => R.owner && h('button', { class: 'reply-btn', type: 'button', 'aria-label': `Reply to message #${m.id}`, onclick: () => setReply(m) }, 'Reply');
+function dayName(ts) {
+  const d = new Date(ts).toDateString();
+  if (d === new Date().toDateString()) return 'Today';
+  if (d === new Date(Date.now() - 864e5).toDateString()) return 'Yesterday';
+  return new Date(ts).toLocaleDateString([], { month: 'long', day: 'numeric' });
+}
 function msgEl(m, prev) {
-  if (m.sender === 'system') return h('div', { class: 'sys', 'data-msg': m.id }, h('span', { class: 'msg-id' }, `#${m.id}`), ' ', ...refNodes(m.body));
+  if (m.sender === 'system') return h('div', { class: 'sys', 'data-msg': m.id }, h('span', { class: 'msg-id' }, `#${m.id}`), ' ', ...refNodes(m.body), ' ', replyBtn(m));
   const own = m.sender === 'human';
   const cont = sameRun(prev, m);
-  const head = !cont && h('div', { class: 'who' },
-    h('strong', {}, own ? 'You' : m.sender),
+  const head = !cont && (!own || m.target || TAGS[m.kind]) && h('div', { class: 'who' },
+    !own && h('strong', {}, m.sender),
     TAGS[m.kind] && h('span', { class: `tag tag-${m.kind}` }, TAGS[m.kind]),
     m.from_room && h('span', { class: 'from', title: `Synced from the division ${m.from_room}` }, m.from_room),
-    m.target && h('span', { class: 'to' }, `to ${m.target === 'human' ? 'you' : m.target === 'all' ? 'everyone' : m.target}`),
-    h('time', { datetime: new Date(m.ts).toISOString() }, clock(m.ts)),
-    h('span', { class: 'msg-id' }, `#${m.id}`));
+    m.target && h('span', { class: 'to' }, `to ${m.target === 'human' ? 'you' : m.target === 'all' ? 'everyone' : m.target}`));
   const state = own && m.handled != null && h('div', { class: 'msg-state', 'data-item': m.id }, itemWords(m));
   // Long posts open short, so the chat stays readable. The full text is one click away.
   const long = !own && String(m.body).trim().split(/\s+/).length > 45;
-  const bubble = h('div', { class: `bubble ${long ? 'clamped' : ''}` }, ...refNodes(m.body));
+  const text = h('div', { class: `bubble-text ${long ? 'clamped' : ''}` }, ...refNodes(m.body));
   const more = long && h('button', { class: 'text-btn more-btn', type: 'button', 'aria-expanded': 'false', onclick: (e) => {
-    const open = bubble.classList.toggle('clamped');
+    const open = text.classList.toggle('clamped');
     e.target.textContent = open ? 'Show more' : 'Show less';
     e.target.setAttribute('aria-expanded', String(!open));
   } }, 'Show more');
-  const main = h('div', { class: 'msg-main' }, head || h('div', { class: 'who cont-id' }, h('span', { class: 'msg-id' }, `#${m.id}`)), bubble, more, state);
+  const quote = m.quote_sender && h('button', { class: 'quote', type: 'button', title: `Go to message #${m.reply_to}`, onclick: () => jumpToMsg(m.reply_to) }, ...quoteNodes(m.quote_sender, m.quote_body));
+  const meta = h('div', { class: 'meta' }, h('time', { datetime: new Date(m.ts).toISOString() }, new Date(m.ts).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })), h('span', { class: 'msg-id' }, `#${m.id}`));
+  if (!long) text.append(meta); // sits at the end of the last line when it fits, like a text message
+  const bubble = h('div', { class: 'bubble' }, quote, text, long && h('div', { class: 'bubble-foot' }, more, meta));
+  const main = h('div', { class: 'msg-main' }, head, h('div', { class: 'bubble-row' }, bubble, replyBtn(m)), state);
   return h('div', { class: `msg ${own ? 'own' : ''} ${cont ? 'cont' : ''} ${m.kind === 'blocked' ? 'blocked' : ''}`, 'data-msg': m.id },
     !own && (cont ? h('span', {}) : badge(m.sender)), main);
 }
 function appendMsgs(frag, msgs) {
   for (const m of msgs) {
     if (!showsInChat(m)) continue;
+    const day = new Date(m.ts).toDateString();
+    if (R.lastDay !== day) {
+      R.lastDay = day;
+      frag.append(h('div', { class: 'day', role: 'separator' }, h('span', {}, dayName(m.ts))));
+      R.lastShown = null;
+    }
     if (!R.dividerPlaced && R.unreadFrom != null && m.id > R.unreadFrom && m.sender !== 'human') {
       R.dividerPlaced = true;
       frag.append(h('div', { class: 'unread', role: 'separator' }, h('span', {}, 'Unread')));
@@ -1328,6 +1521,7 @@ function rebuildChat() {
   const frag = document.createDocumentFragment();
   R.dividerPlaced = false;
   R.lastShown = null;
+  R.lastDay = null;
   if (R.exhausted && R.msgs.length) frag.append(h('div', { class: 'chat-start' }, 'This is the start of the discussion.'));
   appendMsgs(frag, R.msgs);
   if (!R.msgs.length) frag.append(h('div', { class: 'chat-empty' }, 'No messages yet. Start an agent, or say what you want done.'));
@@ -1809,6 +2003,7 @@ function openSettings() {
       const wrap = h('fieldset', { disabled: !R.owner },
         mainForm,
         h('div', { class: 'dlg-group' }, h('h3', {}, 'Security level'), askRadioGroup, confirmBox, secErr),
+        h('div', { class: 'dlg-group' }, h('h3', {}, "Agents' files"), h('span', { class: 'hint' }, 'Pages agents keep for their own work, off the report.'), h('div', { class: 'row' }, h('button', { class: 'btn', type: 'button', onclick: openFiles }, `Open (${v.details.filter((x) => !x.shown).length})`))),
         renameForm, delForm);
       body.append(wrap);
     },

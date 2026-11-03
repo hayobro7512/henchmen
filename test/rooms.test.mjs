@@ -43,9 +43,12 @@ function askTool(tool, input) {
   });
 }
 for await (const l of readline.createInterface({ input: process.stdin })) {
-  const text = JSON.parse(l).message.content;
+  const input = JSON.parse(l);
+  if (input.type === 'control_request') { appendFileSync(${JSON.stringify(received)}, JSON.stringify({ interrupt: input.request.subtype }) + '\\n'); continue; }
+  const text = input.message.content;
   appendFileSync(${JSON.stringify(received)}, JSON.stringify({ text }) + '\\n');
   if (text.includes('CRASH')) process.exit(3);
+  if (text.includes('BIGCONTEXT')) say({ type: 'assistant', message: { content: [], usage: { input_tokens: 10, cache_read_input_tokens: 200000, cache_creation_input_tokens: 5 } } });
   if (text.includes('NEEDS_PERMISSION')) {
     const out = await askTool('Bash', { command: 'rm -rf build sk-ant-abcdefgh12345678' });
     appendFileSync(${JSON.stringify(received)}, JSON.stringify({ decision: out.includes('allow') ? 'allow' : 'deny' }) + '\\n');
@@ -65,6 +68,10 @@ const typedLog = join(home, 'typed.log');
 const agentsStub = join(home, 'agents-stub.sh');
 writeFileSync(agentsStub, `#!/bin/sh\ncat "${agentsList}"\n`);
 chmodSync(agentsStub, 0o755);
+const closedLog = join(home, 'closed.log');
+const closeStub = join(home, 'close-stub.sh');
+writeFileSync(closeStub, `#!/bin/sh\nprintf '%s\\n' "$1" >> "${closedLog}"\n`);
+chmodSync(closeStub, 0o755);
 const typeStub = join(home, 'type-stub.sh');
 writeFileSync(typeStub, `#!/bin/sh\nprintf '%s\\n' "$1" >> "${typedLog}"\n`);
 chmodSync(typeStub, 0o755);
@@ -73,7 +80,7 @@ const pickerOut = join(home, 'picker-out');
 writeFileSync(picker, `#!/bin/sh\n[ -s "${pickerOut}" ] || exit 1\ncat "${pickerOut}"\n`);
 chmodSync(picker, 0o755);
 // HENCHMEN_AGENT is cleared so these tests also pass when an agent runs them.
-const env = { ...process.env, HOME: join(home, 'userhome'), HENCHMEN_AGENT: '', HENCHMEN_AGENTS_STUB: agentsStub, HENCHMEN_TYPE_STUB: typeStub, HENCHMEN_WINDOW_MS: '200', HENCHMEN_PICKER: picker, HENCHMEN_HOME: home, HENCHMEN_PORT: PORT, HENCHMEN_CLAUDE: fake, HENCHMEN_WORDS: '100', HENCHMEN_QUIET_MS: '300', HENCHMEN_NO_TABS: '1' };
+const env = { ...process.env, HOME: join(home, 'userhome'), HENCHMEN_AGENT: '', HENCHMEN_AGENTS_STUB: agentsStub, HENCHMEN_TYPE_STUB: typeStub, HENCHMEN_WINDOW_MS: '200', HENCHMEN_PICKER: picker, HENCHMEN_HOME: home, HENCHMEN_PORT: PORT, HENCHMEN_CLAUDE: fake, HENCHMEN_WORDS: '100', HENCHMEN_QUIET_MS: '300', HENCHMEN_IDLE_MS: '400', HENCHMEN_CLOSE_STUB: closeStub, HENCHMEN_NO_TABS: '1' };
 const CLI = new URL('../bin/henchmen', import.meta.url).pathname;
 let server;
 let ownerToken;
@@ -328,6 +335,33 @@ test('detail pages hold what the report cannot', () => {
   const R = 'proj/big';
   assert.match(br([R, 'a', 'detail', 'notes'], Array(500).fill('word').join(' ')).out, /saved/);
   assert.match(br([R, 'a', 'detail']).out, /notes/);
+});
+
+test('pages stay off the report until marked, and the human can delete what is off it', async () => {
+  br(['new', 'files']);
+  const v0 = await view('files');
+  const id = v0.room.id;
+  const shown = async () => (await view('files')).details.filter((d) => d.shown).map((d) => d.name);
+  assert.match(br(['files', 'a', 'detail', 'scratch'], 'working notes').out, /off the human's report[\s\S]*--show/);
+  assert.deepEqual(await shown(), []);
+  assert.match(br(['files', 'a', 'detail', 'scratch']).out, /working notes/); // agents still read it
+  assert.match(br(['files', 'a', 'detail', 'for-you', '--show'], 'read this').out, /saved and is on the human's report/);
+  assert.deepEqual(await shown(), ['for-you']);
+  br(['files', 'a', 'detail', 'for-you'], 'read this, updated');
+  assert.deepEqual(await shown(), ['for-you']); // an update stays on the report
+  assert.match(br(['files', 'a', 'detail']).out, /for-you \(on the human's report\)/);
+  for (let i = 0; i < 7; i++) br(['files', 'a', 'detail', `p${i}`, '--show'], 'x');
+  assert.match(br(['files', 'a', 'detail', 'ninth', '--show'], 'x').err, /REFUSED: the report lists 8 pages at most/);
+  assert.equal((await shown()).length, 8);
+  assert.match(br(['files', 'a', 'detail', 'p0', '--hide']).out, /off the human's report/);
+  assert.ok((await page('detailShown', { id, name: 'ninth', shown: 1 })).json().ok);
+  assert.ok((await shown()).includes('ninth'));
+  assert.equal((await page('deleteDetails', { id, name: 'scratch' })).json().deleted, 1);
+  const off = (await view('files')).details.filter((d) => !d.shown).length;
+  assert.equal((await page('deleteDetails', { id })).json().deleted, off);
+  const after = (await view('files')).details;
+  assert.equal(after.length, 8);
+  assert.ok(after.every((d) => d.shown)); // delete-all leaves the report alone
 });
 
 test('worked example 3: blocked syncs up and needs the human; a note stays put', async () => {
@@ -1158,7 +1192,221 @@ test('with nobody free the message waits, and a stopped agent gives its message 
   const w1 = waiting(['fw', 'term', 'wait', '20']);
   await sleep(300);
   await page('say', { id, body: 'for a waiter' });
-  assert.match(await until(3000, w1), /\[yours: you were first free\]: for a waiter/);
+  assert.match(await until(3000, w1), /\[yours\]: for a waiter/);
+});
+
+test('a reply goes straight to who wrote the message, and the answer attaches to it', async () => {
+  br(['new', 'rp', '--dir', home]);
+  const id = roomId('rp');
+  for (const name of ['a1', 'a2']) {
+    await page('start', { id, name, task: 'go', cap: 5 });
+    await until2(async () => (await view('rp')).agents.find((a) => a.name === name)?.run?.status === 'idle');
+  }
+  const posted = Number(br(['rp', 'a2', 'post', 'note', 'I checked the parser']).out.match(/#(\d+)/)[1]);
+  const sent = (await page('say', { id, body: 'REPLY-ONE fix it', reply_to: posted })).json().id;
+  const got = (await view('rp')).messages.find((m) => m.id === sent);
+  assert.equal(got.target, 'a2');
+  assert.equal(got.reply_to, posted);
+  assert.equal(got.quote_sender, 'a2');
+  assert.match(got.quote_body, /checked the parser/);
+  assert.equal(turns().filter((t) => t.text?.includes('REPLY-ONE')).length, 1);
+  assert.ok(turns().find((t) => t.text?.includes('REPLY-ONE')).text.includes(`Replying to #${posted} from you`));
+  // Its answer attaches to the message.
+  const done = await until2(async () => { const x = await view('rp'); return x.items.find((i) => i.id === sent)?.handled === 2 && x; });
+  assert.equal(done.items.find((i) => i.id === sent).taken_by, 'a2');
+  const answer = done.messages.find((m) => m.sender === 'a2' && m.id > sent);
+  if (answer) assert.equal(answer.reply_to, sent);
+  assert.equal((await page('say', { id, body: 'x', reply_to: 999999 })).status, 404);
+  // Naming a task goes to its owner; naming two doesn't pick.
+  const task = (await page('task', { id, title: 'the parser', owner: 'a1' })).json().id ?? (await view('rp')).tasks[0].id;
+  const toOwner = (await page('say', { id, body: `how is task ${task} going` })).json().id;
+  assert.equal((await view('rp')).messages.find((m) => m.id === toOwner).target, 'a1');
+  // A reply to someone who has left goes to whoever's free, with the quote.
+  br(['rp', 'gone', 'sync']);
+  const old = Number(br(['rp', 'gone', 'post', 'note', 'leaving soon']).out.match(/#(\d+)/)[1]);
+  br(['rp', 'gone', 'leave']);
+  const left = (await page('say', { id, body: 'are you still on this', reply_to: old })).json().id;
+  const orphan = (await view('rp')).messages.find((m) => m.id === left);
+  assert.equal(orphan.target, null);
+  assert.equal(orphan.quote_sender, 'gone');
+  await page('stopAll', { id });
+});
+
+test('whoever has a message can pass it straight on, twice at most, and answers attach to it', async () => {
+  br(['new', 'ps']);
+  const id = roomId('ps');
+  for (const n of ['one', 'two', 'three']) br(['ps', n, 'sync']);
+  const sent = (await page('say', { id, body: 'PASS-ME along' })).json().id;
+  assert.match(br(['ps', 'one', 'take', String(sent)]).out, /is yours/);
+  assert.equal(br(['ps', 'two', 'pass', String(sent), '@three']).code, 1); // not its to give
+  assert.match(br(['ps', 'one', 'pass', String(sent), '@ghost']).err, /isn't in this room/);
+  assert.match(br(['ps', 'one', 'pass', String(sent), '@two']).out, /is two's now/);
+  assert.equal((await view('ps')).items.find((i) => i.id === sent).taken_by, 'two');
+  assert.match(br(['ps', 'two', 'sync']).out, /\[yours\]: PASS-ME along/);
+  assert.match(br(['ps', 'two', 'pass', String(sent), '@three']).out, /is three's now/);
+  assert.match(br(['ps', 'three', 'pass', String(sent), '@one']).err, /passed 2 times already/);
+  // What it posts while it has the message answers that message, with no flag.
+  const ans = Number(br(['ps', 'three', 'post', 'note', 'Done, it is along']).out.match(/#(\d+)/)[1]);
+  const v = await view('ps');
+  assert.equal(v.messages.find((m) => m.id === ans).reply_to, sent);
+  assert.equal(v.messages.find((m) => m.id === ans).quote_sender, 'human');
+  // Between agents, --reply goes to the writer and shows them what it answers.
+  const q = Number(br(['ps', 'one', 'post', 'note', 'which file?']).out.match(/#(\d+)/)[1]);
+  br(['ps', 'two', 'sync']);
+  br(['ps', 'two', 'post', 'note', '--reply', String(q), 'parser.ts']);
+  const seen = br(['ps', 'one', 'sync']).out;
+  assert.match(seen, /two>one note Replying to #\d+ from you: "which file\?"\.: parser\.ts/);
+  assert.equal(br(['ps', 'one', 'post', 'note', '--reply', '999999', 'x']).code, 1);
+});
+
+test('a window agent that ends closes its tab; stop idle spares the leader and anyone busy', async () => {
+  const fs = await import('node:fs');
+  const closed = () => (fs.existsSync(closedLog) ? readFileSync(closedLog, 'utf8') : '');
+  br(['new', 'tabs', '--dir', home]);
+  const id = roomId('tabs');
+  const names = ['boss', 'busy', 'lazy', 'quit'];
+  for (const name of names) await page('start', { id, name, task: 'go', mode: 'window' });
+  const list = (status) => names.map((n, i) => ({ name: `tabs/${n}`, pid: process.pid, status: n === 'busy' ? 'busy' : status, sessionId: `t${i}`, cwd: home }));
+  writeFileSync(agentsList, JSON.stringify(list('idle')));
+  const state = (n) => view('tabs').then((v) => v.agents.find((a) => a.name === n)?.run?.status);
+  await until2(async () => (await state('lazy')) === 'idle' && (await state('boss')) === 'idle');
+  // Just gone idle: could be between steps, so nobody stops yet.
+  assert.equal((await page('stopIdle', { id })).json().stopped, 0);
+  await sleep(600);
+  const { stopped } = (await page('stopIdle', { id })).json();
+  assert.equal(stopped, 2); // lazy and quit: not the leader, not the busy one
+  writeFileSync(agentsList, JSON.stringify(list('idle').filter((a) => /boss|busy/.test(a.name))));
+  await until2(() => /lazy/.test(closed()) && /quit/.test(closed()));
+  assert.doesNotMatch(closed(), /boss|busy/);
+  // An agent that leaves on its own gets stopped too, once its turn can end.
+  assert.match(br(['tabs', 'busy', 'leave']).out, /terminal closes shortly/);
+  await page('stopAll', { id });
+  writeFileSync(agentsList, '[]');
+  await until2(() => /boss/.test(closed()) && /busy/.test(closed()));
+});
+
+test('@everyone reaches the whole crew, divisions too, and each answers for itself', async () => {
+  br(['new', 'ev', '--dir', home]);
+  br(['new', 'ev/kid', '--dir', home]);
+  const id = roomId('ev');
+  for (const name of ['e1', 'e2']) {
+    await page('start', { id, name, task: 'go', cap: 5 });
+    await until2(async () => (await view('ev')).agents.find((a) => a.name === name)?.run?.status === 'idle');
+  }
+  await page('start', { id: roomId('ev/kid'), name: 'e3', task: 'go', cap: 5 });
+  await until2(async () => (await view('ev/kid')).agents.find((a) => a.name === 'e3')?.run?.status === 'idle');
+  const count = (t) => turns().filter((x) => x.text?.includes(t)).length;
+  const sent = (await page('say', { id, body: '@everyone ALL-HANDS now' })).json().id;
+  await until2(() => count('Message from your user to the whole crew: ALL-HANDS') === 3);
+  const v = await view('ev');
+  const m = v.messages.find((x) => x.id === sent);
+  assert.equal(m.target, 'all');
+  assert.equal(m.body, 'ALL-HANDS now');
+  assert.equal(m.handled, null); // no one agent owns it
+  assert.ok((await view('ev/kid')).messages.some((x) => x.body === 'ALL-HANDS now'));
+  // A terminal session gets it as addressed to it, and nobody can name themselves everyone.
+  assert.match(br(['ev', 'looker', 'sync']).out, /ALL-HANDS now/);
+  assert.equal(br(['ev', 'looker', 'rename', 'everyone']).code, 1);
+  await page('stopAll', { id });
+});
+
+test('drop everything interrupts everyone, cancels the queue and approvals, and holds the room', async () => {
+  const fs = await import('node:fs');
+  br(['new', 'dr', '--dir', home]);
+  const id = roomId('dr');
+  const typed = () => (fs.existsSync(typedLog) ? readFileSync(typedLog, 'utf8') : '');
+  writeFileSync(typedLog, '');
+  await page('start', { id, name: 'pg', task: 'go', cap: 5, mode: 'background' });
+  await until2(async () => (await view('dr')).agents.find((a) => a.name === 'pg')?.run?.status === 'idle');
+  // A stand-in session: a real process whose command line looks like the agent's.
+  const fakeSession = spawn(process.execPath, ['-e', 'setInterval(()=>{},1000)', 'claude', 'dr/win'], { stdio: 'ignore' });
+  const started = (await page('start', { id, name: 'win', task: 'go', mode: 'window' })).json();
+  const script = started.tab.command.match(/'([^']+\.sh)'/)[1];
+  const list = (pid, status) => writeFileSync(agentsList, JSON.stringify([{ name: 'dr/win', pid, status, sessionId: 'sess-1', cwd: home }]));
+  list(fakeSession.pid, 'busy');
+  await until2(async () => (await view('dr')).agents.find((a) => a.name === 'win')?.run?.status === 'running');
+  br(['dr', 'term', 'sync']);
+  // Busy at once: an open order to someone, one waiting for nobody.
+  const held = (await page('say', { id, body: '@win old order' })).json().id;
+  const queuedFor = br(['dr', 'term', 'post', 'note', '@pg', 'agent to agent']).out;
+  assert.match(queuedFor, /sent/);
+  const r = (await page('dropEverything', { id, body: 'FULL-STOP check the deploy' })).json();
+  assert.equal(r.interrupted >= 1, true);
+  // The window session was soft-interrupted, and comes back on the same history with only the order.
+  await until2(() => fakeSession.exitCode !== null || fakeSession.signalCode !== null);
+  assert.equal(fakeSession.signalCode, 'SIGINT');
+  await until2(() => typed().includes(`sh '${script}'`));
+  const body = readFileSync(script, 'utf8');
+  assert.match(body, /--resume 'sess-1' -- "\$\(cat /);
+  assert.match(readFileSync(script.replace(/\.sh$/, '.first'), 'utf8'), /overrides everything: FULL-STOP check the deploy[\s\S]*Start nothing else/);
+  const v = await view('dr');
+  assert.equal(v.room.paused, true);
+  assert.equal(v.items.find((i) => i.id === held).handled, 3);
+  assert.ok(v.needs.some((n) => n.type === 'paused'));
+  const order = v.messages.find((m) => m.body === 'FULL-STOP check the deploy');
+  assert.equal(order.target, 'all');
+  assert.deepEqual(v.messages.filter((m) => m.id > order.id).map((m) => [m.sender, m.target, m.body.slice(0, 60)]).filter((x) => x[1] && x[1] !== 'human'), []); // nothing wakes anyone after it
+  // The page agent gets a real interrupt and the order as its next turn.
+  assert.ok(turns().some((t) => t.text?.includes('overrides everything: FULL-STOP') && t.text.includes('You are pg.')));
+  // It's alive again once a new session shows; a second press keeps working on the new one.
+  const back = spawn(process.execPath, ['-e', 'setInterval(()=>{},1000)', 'claude', 'dr/win'], { stdio: 'ignore' });
+  list(back.pid, 'idle');
+  await until2(async () => (await view('dr')).agents.find((a) => a.name === 'win')?.run?.status === 'idle');
+  assert.ok((await view('dr')).agents.find((a) => a.name === 'win').live);
+  // Keep going lifts it.
+  await page('resume', { id });
+  const after = await view('dr');
+  assert.equal(after.room.paused, false);
+  assert.ok(after.messages.some((m) => m.target === 'all' && /Go back to the work/.test(m.body)));
+  assert.ok(turns().some((t) => t.text?.includes('to the whole crew: Keep going.')));
+  await page('stopAll', { id });
+  back.kill();
+  writeFileSync(agentsList, '[]');
+});
+
+test('a new agent never shares a session name with one that renamed itself', async () => {
+  br(['new', 'nm', '--dir', home]);
+  const id = roomId('nm');
+  const nameIn = (s) => readFileSync(s.tab.command.match(/'([^']+\.sh)'/)[1], 'utf8').match(/'--name' '([^']+)'/)[1];
+  const first = (await page('start', { id, name: 'agent-1', task: 'go', mode: 'window' })).json();
+  assert.equal(nameIn(first), 'nm/agent-1');
+  br(['nm', 'agent-1', 'rename', 'tester']);
+  const second = (await page('start', { id, name: 'agent-1', task: 'go', mode: 'window' })).json();
+  assert.notEqual(nameIn(second), 'nm/agent-1');
+  assert.match(nameIn(second), /^nm\/agent-1-/);
+  await page('stopAll', { id });
+});
+
+test('room actions: find in chat, and compact by hand or past a chosen limit', async () => {
+  br(['new', 'ac', '--dir', home]);
+  const id = roomId('ac');
+  await page('start', { id, name: 'mem', task: 'go', cap: 5, mode: 'background' });
+  await until2(async () => (await view('ac')).agents.find((a) => a.name === 'mem')?.run?.status === 'idle');
+  const find = async (t) => (await (await fetch(`${origin}/api/room/${id}/search?q=${encodeURIComponent(t)}`)).json()).results;
+  const hit = (await page('say', { id, body: 'the 100%_real invoice number' })).json().id;
+  await page('say', { id, body: 'something else' });
+  assert.deepEqual((await find('100%_real')).map((m) => m.id), [hit]);
+  assert.deepEqual(await find('100%xreal'), []); // % and _ are plain characters here
+  await until2(async () => (await view('ac')).items.every((i) => i.handled === 2));
+  // By hand.
+  const compacts = () => turns().filter((t) => t.text?.startsWith('/compact')).length;
+  const before = compacts();
+  await sleep(50);
+  assert.equal((await page('compact', { id, name: 'mem' })).json().compacted, 1);
+  await until2(() => compacts() === before + 1);
+  await until2(async () => (await view('ac')).agents.find((a) => a.name === 'mem')?.run?.status === 'idle');
+  // Past the limit, once, and only when the choice is on.
+  await page('say', { id, body: 'BIGCONTEXT here' });
+  await until2(async () => (await view('ac')).contexts.mem === 200015);
+  await sleep(1300);
+  assert.equal(compacts(), before + 1); // off by default, and the hand-run one is recent anyway
+  await page('compactAt', { id, tokens: 150000 });
+  assert.equal((await view('ac')).compact_at, 150000);
+  // A fresh agent over the limit compacts by itself once it has rested, and says so in the chat.
+  await page('start', { id, name: 'mem2', task: 'go BIGCONTEXT', cap: 5, mode: 'background' });
+  await until2(async () => (await view('ac')).messages.some((m) => m.sender === 'system' && /Compacted mem2's memory, which had reached about 200k/.test(m.body)));
+  await until2(() => compacts() === before + 2);
+  await page('stopAll', { id });
 });
 
 test('stop all ends the crew without succession chatter', async () => {

@@ -27,7 +27,9 @@ If you're alone in the room with nothing pending, finish normally. When your wor
 
 ## Report
 
-The report is the only thing written for the human. Use `report show` for the versions, then `report set <section> --base <version>`. `STALE` returns the current text: merge and retry. `REFUSED` means it won't fit the one-page limit: tighten it, and put detail on a `detail` page. Update it at each milestone and before you stop.
+The report is the only thing written for the human. Use `report show` for the versions, then `report set <section> --base <version>`. `STALE` returns the current text: merge and retry. `REFUSED` means it won't fit the one-page limit: tighten it, and put detail on a `detail` page. Pages stay in the room's files, off the report; run `detail NAME --show` for one the human should read (8 at most). Update it at each milestone and before you stop.
+
+Your user texts the crew. A message marked as yours is yours: do it and answer it yourself, and what you post while you have it attaches to it. If it's really another agent's work, run `pass ID @name`; it goes straight to them, so post nothing. To answer another agent's message, use `post KIND --reply ID`.
 
 ## Trust
 
