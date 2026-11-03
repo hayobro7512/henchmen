@@ -459,10 +459,11 @@ function buildRoom() {
   E.emptyReport = h('div', { class: 'empty', hidden: true });
   E.words = h('span', {});
   E.addBtn = h('button', { class: 'text-btn', type: 'button', disabled: !R.owner, onclick: openAddSection }, 'Add section');
+  E.cleanBtn = h('button', { class: 'text-btn', type: 'button', disabled: !R.owner, title: 'Ask the leader to keep only what you need on the report', onclick: cleanDocs }, 'Clean up docs');
   E.goalText = h('span', {});
   E.goalEdit = h('button', { class: 'text-btn', type: 'button', onclick: openSettings });
   E.goalRule = h('div', { class: 'goal-rule' });
-  E.report.append(h('div', { class: 'goal' }, h('strong', {}, 'Goal: '), E.goalText, ' ', E.goalEdit, E.goalRule), E.emptyReport, E.sections, E.addSlot, E.rollups, E.details, h('div', { class: 'report-foot' }, E.words, E.addBtn));
+  E.report.append(h('div', { class: 'goal' }, h('strong', {}, 'Goal: '), E.goalText, ' ', E.goalEdit, E.goalRule), E.emptyReport, E.sections, E.addSlot, E.rollups, E.details, h('div', { class: 'report-foot' }, E.words, h('span', { class: 'foot-btns' }, E.cleanBtn, E.addBtn)));
 
   E.chat = h('div', { class: 'chat', tabindex: '0', role: 'log', 'aria-label': 'Discussion messages', onscroll: onChatScroll });
   E.jump = h('button', { class: 'btn jump', type: 'button', hidden: true, onclick: () => { scrollChatEnd(); onChatScroll(); } });
@@ -762,7 +763,15 @@ function fillPop(a) {
     E.input.focus();
   } }, `Message ${a.name}`);
   const stop = a.live && h('button', { class: 'btn danger', type: 'button', ...owned }, `Stop ${a.name}`);
-  if (stop) stop.addEventListener('click', () => run(stop, async () => { await act('stop', { id: R.id, name: a.name }); closePop(); R.popAgent = null; tick(); }));
+  const interrupt = a.live && h('button', { class: 'btn', type: 'button', ...owned, title: 'Like pressing Esc in its terminal: it drops what it is doing and reads your message next', onclick: () => { closePop(); R.popAgent = null; openInterrupt(a.name); } }, `Interrupt ${a.name}`);
+  // Any one agent can be taken off the crew. A running one is stopped first. The first click asks.
+  const remove = h('button', { class: 'btn', type: 'button', ...owned, onclick: (e) => {
+    const b = e.currentTarget;
+    if (!b.dataset.sure) { b.dataset.sure = '1'; b.textContent = a.live ? `Yes, stop and remove ${a.name}` : `Yes, remove ${a.name}`; b.classList.add('danger'); return; }
+    run(b, async () => { await act('remove', { id: R.id, name: a.name }); closePop(); R.popAgent = null; toast(`Removed ${a.name}. It left a handoff in Agents' files.`); tick(); });
+  } }, 'Remove from crew');
+  const details = (page || win) && R.owner && h('button', { class: 'btn', type: 'button', onclick: () => { closePop(); R.popAgent = null; openAgent(a.name); } }, 'Subagents and steps');
+  if (stop) stop.addEventListener('click', () => run(stop, async () => { await act('stop', { id: R.id, name: a.name }); closePop(); R.popAgent = null; toast(`Stopped ${a.name}. It left a handoff in Agents' files.`); tick(); }));
   // This redraws while open, so the button in use keeps focus.
   const focused = E.pop.contains(document.activeElement) ? document.activeElement.textContent : null;
   E.pop.replaceChildren(
@@ -770,11 +779,49 @@ function fillPop(a) {
     h('dl', {}, rows.flatMap(([k, val]) => [h('dt', {}, k), h('dd', {}, val)])),
     ...(inTerminal ? [h('p', { class: 'pop-note' }, "It's in a full terminal session with you. Messages sent now are held and delivered when it returns.")] : []),
     ...(win && a.live ? [h('p', { class: 'pop-note' }, "Runs in its own terminal window on your plan. Room messages are typed into it; they wait while it's asking you something.")] : []),
-    ...(a.here && a.source === 'terminal' ? [h('p', { class: 'pop-note' }, 'This session runs in your own terminal.')] : []),
-    ...(a.live || a.here ? [h('div', { class: 'pop-actions' }, message, talk, stop)] : []),
+    ...(a.here && a.source === 'terminal' ? [h('p', { class: 'pop-note' }, "It runs in a terminal Henchmen didn't open, or it's a name left behind with no session. If it's not really there, remove it.")] : []),
+    h('div', { class: 'pop-actions' }, details, message, talk, interrupt, stop, remove),
     ...(command ? [commandBox(command)] : []));
   if (focused) [...E.pop.querySelectorAll('button')].find((b) => b.textContent === focused)?.focus();
   if (popEl === E.pop) E.pop.style.top = `${Math.max(12, Math.min(parseFloat(E.pop.style.top), innerHeight - E.pop.offsetHeight - 12))}px`;
+}
+// Everything an agent is running, read from its Claude Code session: subagents, background shells, and its latest steps.
+const JOB_WORD = { running: 'Running', finished: 'Done', failed: 'Failed', stopped: 'Stopped', ended: 'Ended with the session' };
+function openAgent(name) {
+  let timer;
+  openDialog({
+    title: name, cls: 'drawer agent-page',
+    onclose: () => clearTimeout(timer),
+    build: (body) => {
+      const draw = async () => {
+        let info;
+        try { info = await getJSON(`/api/room/${R.id}/activity?name=${encodeURIComponent(name)}`); } catch (e) { info = { error: e.message }; }
+        if (!body.isConnected) return;
+        const a = R.v.agents.find((x) => x.name === name);
+        const facts = [['State', a ? stateText(a) : 'Gone'], ['Task', a?.task || a?.doing || 'Picks its own work']];
+        if (a?.run?.model) facts.push(['Model', a.run.model]);
+        if (a?.live && R.v.contexts?.[name] != null) facts.push(['Memory', tokensText(R.v.contexts[name])]);
+        const job = (j) => h('li', { class: `job ${j.status}` },
+          h('span', { class: 'job-state' }, JOB_WORD[j.status] || j.status),
+          h('strong', {}, j.what || (j.kind === 'monitor' ? 'A monitor' : 'A command')),
+          h('span', { class: 'hint' }, [j.kind === 'subagent' ? j.type : j.kind === 'monitor' ? 'monitor' : 'shell', j.model && j.model.replace(/^claude-/, ''), j.ts && ago(j.ts)].filter(Boolean).join(', ')),
+          j.now && h('span', { class: 'job-now' }, `Now: ${j.now}`));
+        const group = (title, list, empty) => h('div', { class: 'dlg-group' }, h('h3', {}, title), list.length ? h('ul', { class: 'file-list' }, list) : h('p', { class: 'hint' }, empty));
+        const open = (xs) => xs.filter((j) => j.status === 'running').length;
+        body.replaceChildren(
+          h('dl', { class: 'facts' }, facts.flatMap(([k, val]) => [h('dt', {}, k), h('dd', {}, val)])),
+          ...(info.error || info.none ? [h('p', { class: 'hint' }, info.error || "There's no session file for it yet, so there's nothing more to show. Agents in your own terminals aren't read.")] : [
+            group(`Subagents${open(info.subagents) ? `, ${open(info.subagents)} running` : ''}`, info.subagents.map(job), 'It hasn’t started any subagents lately.'),
+            group(`Background shells and monitors${open(info.shells) ? `, ${open(info.shells)} running` : ''}`, info.shells.map(job), 'Nothing running in the background.'),
+            group('Latest steps', info.steps.map((x) => h('li', { class: `step ${x.running ? 'running' : x.failed ? 'failed' : ''}` }, h('strong', {}, x.tool), h('span', {}, x.what), h('span', { class: 'hint' }, x.running ? 'running now' : x.failed ? `failed, ${ago(x.ts)}` : ago(x.ts)))), 'No steps yet.'),
+            h('p', { class: 'hint' }, 'Read from its Claude Code session file. Updates every few seconds.'),
+          ]));
+        timer = setTimeout(draw, 4000);
+      };
+      body.append(h('p', { class: 'hint' }, 'Reading its session'));
+      draw();
+    },
+  });
 }
 function openClearGone() {
   const gone = R.v.agents.filter((a) => !a.here && !a.live);
@@ -795,6 +842,17 @@ function openClearGone() {
         h('p', { class: 'hint' }, "Unfinished tasks become unassigned and claims are released. This doesn't close any terminal: a silent session can look gone, and it rejoins by syncing under its name."),
         err, h('div', { class: 'row' }, btn));
     },
+  });
+}
+// The leader tidies the report and pages, or hands it to a smaller model if there's a lot.
+function cleanDocs(e) {
+  const leader = R.v.leader;
+  if (!leader) { toast('No leader here yet. Start one, then ask again.'); return; }
+  run(e.target, async () => {
+    await act('say', { id: R.id, target: leader, body: "Clean up my docs. Keep on my report only what I need to read now: where things stand, what needs me, and results I asked for. Merge sections that overlap, cut stale or finished detail, and take pages I don't need off my report with: detail NAME --hide. Remove a section with: report set NAME < /dev/null. Keep the facts: move detail into a page rather than lose it. If it's a lot, hand it to a Haiku or Sonnet subagent. Then tell me in one line what changed." });
+    R.stick = true;
+    toast(`Asked ${leader} to clean up your docs.`);
+    tick();
   });
 }
 // Everything agents keep for themselves, away from the report. Deleting can't be undone, so the first click only asks.
@@ -856,14 +914,25 @@ function applySplit() {
   R.el.split.style.setProperty('--split', x);
   R.el.rail.firstChild.setAttribute('aria-valuenow', String(Math.round(x * 100)));
 }
-function setSplit(x) { store.set('split', clampSplit(x)); applySplit(); }
+function setSplit(x, place = chatPlace()) { store.set('split', clampSplit(x)); applySplit(); place(); }
+// Resizing rewraps the chat, so it keeps its place: on the newest message if it was there, or else on the message at the top.
+function chatPlace() {
+  const c = R.el.chat;
+  if (R.stick) return () => scrollChatEnd();
+  const top = c.getBoundingClientRect().top;
+  const anchor = [...c.querySelectorAll('[data-msg]')].find((m) => m.getBoundingClientRect().bottom > top);
+  if (!anchor) return () => {};
+  const offset = anchor.getBoundingClientRect().top - top;
+  return () => { c.scrollTop += anchor.getBoundingClientRect().top - top - offset; };
+}
 function startDrag(e) {
   if (e.button !== 0) return;
   const handle = e.currentTarget;
   handle.setPointerCapture(e.pointerId);
   const box = R.el.split.getBoundingClientRect();
   const rail = R.el.rail.offsetWidth;
-  const move = (m) => setSplit((m.clientX - box.left - rail / 2) / (box.width - rail));
+  const place = chatPlace(); // taken once, where it was when the drag began
+  const move = (m) => setSplit((m.clientX - box.left - rail / 2) / (box.width - rail), place);
   const up = () => { handle.removeEventListener('pointermove', move); handle.removeEventListener('pointerup', up); handle.removeEventListener('pointercancel', up); };
   handle.addEventListener('pointermove', move);
   handle.addEventListener('pointerup', up);
@@ -1181,17 +1250,46 @@ function buildComposer() {
   const E = R.el;
   E.input = h('textarea', {
     rows: 1, 'aria-label': 'Message', disabled: !R.owner,
-    placeholder: R.owner ? 'Tell your crew what to do. @name picks one, /skill runs a skill.' : VIEW_ONLY,
+    placeholder: R.owner ? `Tell your crew what to do. @name picks one, /skill runs a skill.${Speech ? ' Hold Space to talk.' : ''}` : VIEW_ONLY,
     oninput: sizeInput,
     onkeydown: composerKeys,
+    onkeyup: (e) => { if (e.key === ' ' && voice.held) stopVoice(); },
+    onblur: () => { if (voice.held) stopVoice(); },
+    onpaste: pastePicture,
   });
+  E.micBtn = Speech && h('button', { class: 'btn mic', type: 'button', disabled: !R.owner, 'aria-pressed': 'false', title: "Talk instead of typing. Click to start and again to stop, or hold Space in the box. Chrome's speech service writes out what you say.", onclick: () => (voice.rec ? stopVoice() : startVoice(false)) }, 'Talk');
   E.menu = inputMenu(E.input, composerOptions);
   E.sendErr = h('p', { class: 'err', role: 'alert' });
   E.sendBtn = h('button', { class: 'btn primary', type: 'submit', disabled: !R.owner }, 'Send');
   E.typing = h('div', { class: 'typing', 'aria-live': 'polite' });
   E.replyBar = h('div', { class: 'reply-bar', hidden: true });
   return h('form', { class: 'composer', onsubmit: (e) => { e.preventDefault(); send(); } }, E.menu.el, E.typing, E.replyBar,
-    h('div', { class: 'composer-row' }, E.input, E.sendBtn), E.sendErr);
+    h('div', { class: 'composer-row' }, E.input, E.micBtn || null, E.sendBtn), E.sendErr);
+}
+// Esc for one agent, with what it should do instead.
+function openInterrupt(name) {
+  openDialog({
+    title: `Interrupt ${name}?`, cls: 'top-confirm',
+    build: (body, d) => {
+      const order = h('textarea', { rows: 2, 'aria-label': 'What should it do instead?', placeholder: 'What should it do instead? Blank means stop and wait for you.' });
+      const err = h('p', { class: 'err', role: 'alert' });
+      const go = h('button', { class: 'btn primary', type: 'submit' }, `Interrupt ${name}`);
+      body.append(h('form', { onsubmit: (e) => {
+        e.preventDefault();
+        run(go, async () => {
+          const { interrupted } = await act('interrupt', { id: R.id, name, body: order.value });
+          d.close();
+          R.stick = true;
+          toast(interrupted ? `Interrupted ${name}. Your message is its next turn.` : `${name} wasn't busy, so it just gets your message.`);
+          tick();
+        }, err);
+      } },
+      h('p', {}, `${name} stops the step it's on, drops the message it was working on, and reads yours next. The rest of the crew keeps going.`),
+      order, err,
+      h('div', { class: 'row top-confirm-actions' }, h('button', { class: 'btn', type: 'button', onclick: () => d.close() }, 'Go back'), go)));
+      queueMicrotask(() => order.focus());
+    },
+  });
 }
 // Asks first, in a small box at the top, because this interrupts everyone at once.
 function openDrop() {
@@ -1259,8 +1357,12 @@ function openActions() {
         tick();
       }, err);
       const limit = h('select', { 'aria-label': 'Compact automatically', disabled: !R.owner, onchange: () => run(null, () => act('compactAt', { id: R.id, tokens: Number(limit.value) }), err) },
-        h('option', { value: '0' }, 'Off: Claude Code decides'), ...[150, 250, 400].map((k) => h('option', { value: String(k * 1000) }, `When a resting agent passes ${k}k tokens`)));
+        h('option', { value: '0' }, 'Let Claude Code decide'), ...[150, 250, 400].map((k) => h('option', { value: String(k * 1000) }, `When a resting agent passes ${k}k tokens`)), h('option', { value: '-1' }, 'Off'));
       limit.value = String(v.compact_at || 0);
+      const limitHint = h('span', { class: 'hint' });
+      const explain = () => { limitHint.textContent = { 0: 'Claude Code compacts an agent on its own when its memory is nearly full.', '-1': "Nothing compacts on its own, not even Claude Code, so once an agent's memory is full its turns fail until you press Compact. Applies to agents started after you pick it." }[limit.value] ?? 'Henchmen compacts a resting agent past this size. Claude Code still compacts one that gets nearly full.'; };
+      explain();
+      limit.addEventListener('change', explain);
       body.append(
         h('div', { class: 'dlg-group' }, h('h3', {}, 'Find in chat'), search, note, results),
         h('div', { class: 'dlg-group' }, h('h3', {}, 'Catch me up'), h('span', { class: 'hint' }, 'Sends the leader a message asking what changed since you last looked.'), h('div', { class: 'row' }, catchUp)),
@@ -1272,7 +1374,7 @@ function openActions() {
           })) : h('p', { class: 'hint' }, 'No agents are running.'),
           err, said,
           live.length > 1 && h('div', { class: 'row' }, (() => { const b = h('button', { class: 'btn', type: 'button', disabled: !R.owner, onclick: () => compact(b) }, 'Compact all resting agents'); return b; })()),
-          h('label', { class: 'field' }, 'Compact automatically', limit)));
+          h('label', { class: 'field' }, 'Compact automatically', limit), limitHint));
       queueMicrotask(() => search.focus());
     },
   });
@@ -1328,7 +1430,77 @@ function send() {
     tick();
   }, E.sendErr).then(() => E.input.focus());
 }
+// A pasted picture is saved where the agents can read it, and its path goes into the message.
+function pastePicture(e) {
+  const file = [...(e.clipboardData?.items || [])].find((x) => x.kind === 'file' && x.type.startsWith('image/'))?.getAsFile();
+  if (!file) return;
+  e.preventDefault();
+  const t = R.el.input;
+  run(null, async () => {
+    const r = await fetch(`/upload?room=${R.id}`, { method: 'POST', headers: { 'content-type': file.type, ...ownerHeaders() }, body: file });
+    if (!r.ok) throw new Error(await r.text());
+    const { path } = await r.json();
+    t.setRangeText(`${t.selectionStart && !/\s$/.test(t.value.slice(0, t.selectionStart)) ? ' ' : ''}[picture: ${path}] `, t.selectionStart, t.selectionEnd, 'end');
+    sizeInput();
+    t.focus();
+  }, R.el.sendErr);
+}
+// ---------- voice ----------
+// What you say goes into the box at the cursor, for you to check and send.
+const Speech = window.SpeechRecognition || window.webkitSpeechRecognition;
+const voice = { rec: null, held: false };
+function startVoice(held) {
+  const E = R.el, t = E.input;
+  if (!Speech || voice.rec || t.disabled) return;
+  const rec = new Speech();
+  rec.continuous = true;
+  rec.interimResults = true;
+  rec.lang = navigator.language || 'en-US';
+  const before = t.value.slice(0, t.selectionStart), after = t.value.slice(t.selectionEnd);
+  const pad = before && !/\s$/.test(before) ? ' ' : '';
+  rec.onresult = (e) => {
+    const said = [...e.results].map((r) => r[0].transcript).join('').trim();
+    t.value = before + pad + said + after;
+    const at = (before + pad + said).length;
+    t.setSelectionRange(at, at);
+    sizeInput();
+  };
+  rec.onerror = (e) => {
+    if (e.error === 'not-allowed' || e.error === 'service-not-allowed') toast('Allow the microphone for this page in Chrome, then try again.');
+    else if (e.error === 'network') toast("Couldn't reach Chrome's speech service. Check your connection.");
+    else if (!['no-speech', 'aborted'].includes(e.error)) toast(`Voice stopped: ${e.error}.`);
+  };
+  rec.onend = () => {
+    if (voice.rec !== rec) return;
+    voice.rec = null;
+    voice.held = false;
+    E.micBtn.classList.remove('on');
+    E.micBtn.setAttribute('aria-pressed', 'false');
+    E.micBtn.textContent = 'Talk';
+    t.dispatchEvent(new Event('input', { bubbles: true })); // the @ and / menus see the words
+  };
+  voice.rec = rec;
+  voice.held = held;
+  E.micBtn.classList.add('on');
+  E.micBtn.setAttribute('aria-pressed', 'true');
+  E.micBtn.textContent = held ? 'Listening' : 'Stop';
+  try { rec.start(); } catch { rec.onend(); }
+}
+function stopVoice() {
+  voice.held = false;
+  voice.rec?.stop(); // it still hands over the last words before it ends
+}
 function composerKeys(e) {
+  // Holding Space talks: the first press types a space as usual, and once the key repeats that space is taken back.
+  if (e.key === ' ' && Speech && !e.isComposing && (e.repeat || voice.held)) {
+    e.preventDefault();
+    if (!voice.held) {
+      const t = R.el.input, at = t.selectionStart;
+      if (at === t.selectionEnd && t.value[at - 1] === ' ') t.setRangeText('', at - 1, at, 'end');
+      startVoice(true);
+    }
+    return;
+  }
   if (R.el.menu.keys(e)) return;
   if (e.key === 'Escape' && R.reply) { setReply(null); return; }
   // isComposing: Enter confirms an IME candidate, it doesn't send.
@@ -1345,8 +1517,8 @@ function inputMenu(input, find, cls = '') {
   let start = 0;
   const hide = () => { el.hidden = true; input.removeAttribute('aria-activedescendant'); };
   const options = () => [...el.querySelectorAll('[role=option]')];
-  const pick = (text) => {
-    input.setRangeText(`${text} `, start, input.selectionStart, 'end');
+  const pick = (text, back = 0) => {
+    input.setRangeText(`${text} `, start - back, input.selectionStart, 'end');
     hide();
     input.dispatchEvent(new Event('input', { bubbles: true }));
     input.focus();
@@ -1362,8 +1534,8 @@ function inputMenu(input, find, cls = '') {
     el.replaceChildren(
       ...(found.notes || []).map((n) => h('li', { class: 'menu-note', role: 'presentation' }, n)),
       ...found.options.map((o, i) => h('li', {
-        id: `${id}-${i}`, class: o.cls, role: 'option', title: o.title, 'aria-selected': 'false', 'data-insert': o.insert,
-        onpointerdown: (ev) => { ev.preventDefault(); pick(o.insert); },
+        id: `${id}-${i}`, class: o.cls, role: 'option', title: o.title, 'aria-selected': 'false', 'data-insert': o.insert, 'data-back': o.back || 0,
+        onpointerdown: (ev) => { ev.preventDefault(); pick(o.insert, o.back); },
       }, o.nodes)));
     el.hidden = false;
     select(options()[0]);
@@ -1382,18 +1554,22 @@ function inputMenu(input, find, cls = '') {
       select(items[(i + (e.key === 'ArrowDown' ? 1 : items.length - 1)) % items.length]);
       return true;
     }
-    if ((e.key === 'Enter' || e.key === 'Tab') && !e.shiftKey && !e.isComposing) { e.preventDefault(); pick(items[i].dataset.insert); return true; }
+    if ((e.key === 'Enter' || e.key === 'Tab') && !e.shiftKey && !e.isComposing) { e.preventDefault(); pick(items[i].dataset.insert, Number(items[i].dataset.back)); return true; }
     return false;
   };
   return { el, keys, hide };
 }
 function composerOptions(before, reload) {
-  const at = before.match(/(?:^|\s)@([a-z0-9._-]*)$/);
+  const at = before.match(/(?:^|\s)@([^\s@]*)$/);
   if (at) {
     const here = R.v.agents.filter((a) => a.here && a.name.startsWith(at[1]));
     const all = 'everyone'.startsWith(at[1]) ? [{ insert: 'everyone', nodes: [badge('everyone'), 'everyone', h('span', { class: 'menu-desc' }, 'the whole crew')] }] : [];
-    const options = [...all, ...here.map((a) => ({ insert: a.name, nodes: [badge(a.name), a.name] }))];
-    return options.length ? { start: before.length - at[1].length, options } : null;
+    // A file goes in as its path, without the @, so the agent reads it as a path.
+    const found = at[1] ? fileOptions(at[1], reload) : { files: [] };
+    const files = found.files.map((f) => ({ insert: f, back: 1, cls: 'file', nodes: [h('span', { class: 'menu-name' }, f)] }));
+    const options = [...all, ...here.map((a) => ({ insert: a.name, nodes: [badge(a.name), a.name] })), ...files];
+    // While files are on their way the menu stays open, so they show up when they arrive.
+    return options.length || found.loading ? { start: before.length - at[1].length, options, notes: found.loading && !options.length ? ['Looking for files'] : [] } : null;
   }
   const skill = before.match(/^@([a-z0-9][a-z0-9._-]*)\s+\/(\S*)$/) || before.match(/^()\/(\S*)$/);
   if (!skill) return null;
@@ -1401,6 +1577,17 @@ function composerOptions(before, reload) {
   const own = R.v.agents.some((a) => a.name === skill[1] && a.here && !a.live);
   const hint = own ? `${skill[1]} runs in your own terminal, so it only reads this as a message.` : skill[1] ? `Runs in ${skill[1]} only.` : 'The first free agent runs it. Start with @name to pick one.';
   return skillOptions(before, skill[2], reload, hint);
+}
+// The room folder's files that match, fetched once per search and kept a minute.
+const fileCache = new Map();
+function fileOptions(query, reload) {
+  const c = fileCache.get(query);
+  if (c && !c.loading && Date.now() - c.at < 60000) return c;
+  if (!c?.loading) {
+    fileCache.set(query, { at: 0, files: c?.files || [], loading: true });
+    getJSON(`/api/room/${R.id}/files?q=${encodeURIComponent(query)}`).then(({ files }) => { fileCache.set(query, { at: Date.now(), files }); reload(); }, () => { fileCache.set(query, { at: Date.now(), files: [] }); reload(); });
+  }
+  return fileCache.get(query);
 }
 // Agents add to the list once they run, so it's fetched again after a minute.
 const skillCache = { list: null, at: 0, loading: false, failed: false };

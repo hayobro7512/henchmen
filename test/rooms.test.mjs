@@ -4,7 +4,7 @@ import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
 import http from 'node:http';
 import net from 'node:net';
-import { mkdtempSync, rmSync, readFileSync, writeFileSync, chmodSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync, readFileSync, writeFileSync, chmodSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
@@ -27,7 +27,7 @@ import { appendFileSync, readFileSync } from 'node:fs';
 import { spawn } from 'node:child_process';
 import readline from 'node:readline';
 const args = process.argv.slice(2);
-appendFileSync(${JSON.stringify(received)}, JSON.stringify({ args }) + '\\n');
+appendFileSync(${JSON.stringify(received)}, JSON.stringify({ args, noCompact: process.env.DISABLE_AUTO_COMPACT ?? null }) + '\\n');
 const say = (o) => process.stdout.write(JSON.stringify(o) + '\\n');
 say({ type: 'system', subtype: 'init', session_id: 'fake-session', slash_commands: ['fakeskill'], apiKeySource: process.env.FAKE_SOURCE ?? 'ANTHROPIC_API_KEY' });
 let cost = 0;
@@ -1406,6 +1406,111 @@ test('room actions: find in chat, and compact by hand or past a chosen limit', a
   await page('start', { id, name: 'mem2', task: 'go BIGCONTEXT', cap: 5, mode: 'background' });
   await until2(async () => (await view('ac')).messages.some((m) => m.sender === 'system' && /Compacted mem2's memory, which had reached about 200k/.test(m.body)));
   await until2(() => compacts() === before + 2);
+  await page('stopAll', { id });
+});
+
+test('compacting Off reaches new agents, a stop leaves a handoff, and the agent page reads its session', async () => {
+  br(['new', 'ao', '--dir', home]);
+  const id = roomId('ao');
+  await page('compactAt', { id, tokens: -1 });
+  assert.equal((await view('ao')).compact_at, -1);
+  const starts = () => turns().filter((t) => t.args?.some((x) => /^Bash\(henchmen ao:/.test(x)));
+  await page('start', { id, name: 'nc', task: 'go', cap: 5, mode: 'background' });
+  await until2(async () => (await view('ao')).agents.find((a) => a.name === 'nc')?.run?.status === 'idle');
+  assert.equal(starts().at(-1).noCompact, '1');
+  // Its session file, as Claude Code writes it: subagents, background shells, notifications and steps.
+  const dir = join(home, 'userhome', '.claude', 'projects', home.replace(/[^a-zA-Z0-9]/g, '-'));
+  const use = (id, name, input) => ({ type: 'assistant', timestamp: new Date().toISOString(), message: { content: [{ type: 'tool_use', id, name, input }] } });
+  const result = (id, toolUseResult, is_error = false) => ({ type: 'user', timestamp: new Date().toISOString(), toolUseResult, message: { content: [{ type: 'tool_result', tool_use_id: id, is_error, content: 'x' }] } });
+  const rows = [
+    use('t1', 'Agent', { description: 'judge the round', subagent_type: 'general-purpose', run_in_background: true }), result('t1', { status: 'async_launched', agentId: 'a1', resolvedModel: 'claude-sonnet-5-5' }),
+    use('t2', 'Bash', { command: 'npm run serve', description: 'start the server', run_in_background: true }), result('t2', { backgroundTaskId: 'b1' }),
+    use('t3', 'Bash', { command: 'npm run build', description: 'build it', run_in_background: true }), result('t3', { backgroundTaskId: 'b2' }),
+    { type: 'user', message: { content: '<task-notification>\n<task-id>b2</task-id>\n<status>failed</status>\n</task-notification>' } },
+    use('t4', 'Agent', { description: 'quick look' }), result('t4', { status: 'completed', agentId: 'a2' }),
+    use('t5', 'Read', { file_path: 'src/app.ts' }),
+  ];
+  mkdirSync(join(dir, 'fake-session', 'subagents'), { recursive: true });
+  writeFileSync(join(dir, 'fake-session.jsonl'), rows.map((r) => JSON.stringify(r)).join('\n') + '\n');
+  writeFileSync(join(dir, 'fake-session', 'subagents', 'agent-a1.meta.json'), JSON.stringify({ toolUseId: 't1' }));
+  writeFileSync(join(dir, 'fake-session', 'subagents', 'agent-a1.jsonl'), JSON.stringify(use('s1', 'Grep', { pattern: 'TODO' })) + '\n');
+  const activity = async () => (await fetch(`${origin}/api/room/${id}/activity?name=nc`, { headers: { 'x-henchmen-owner': ownerToken } })).json();
+  assert.equal((await fetch(`${origin}/api/room/${id}/activity?name=nc`)).status, 403); // the owner's only
+  let a = await activity();
+  assert.deepEqual(a.subagents.map((j) => [j.what, j.status, j.now ?? null, j.model ?? null]), [['judge the round', 'running', 'Grep: TODO', 'claude-sonnet-5-5'], ['quick look', 'finished', null, null]]);
+  assert.deepEqual(a.shells.map((j) => [j.what, j.status]), [['start the server', 'running'], ['build it', 'failed']]);
+  assert.deepEqual([a.steps[0].tool, a.steps[0].what, a.steps[0].running], ['Read', 'src/app.ts', true]);
+  // Stopped from the page: a handoff, and what it ran ended with it.
+  await page('stop', { id, name: 'nc' });
+  const v = await until2(async () => { const x = await view('ao'); return x.details.some((d) => d.name === 'Handoff: nc') && x; });
+  assert.ok(v, 'a handoff page');
+  assert.match((await (await fetch(`${origin}/api/room/${id}/detail?name=${encodeURIComponent('Handoff: nc')}`)).json()).body, /when nc was stopped/);
+  a = await activity();
+  assert.deepEqual(a.shells.map((j) => j.status), ['ended', 'failed']);
+  rmSync(join(dir, 'fake-session.jsonl'));
+  rmSync(join(dir, 'fake-session'), { recursive: true });
+});
+
+test('a name left behind by a rename stays put, and any one agent can be removed', async () => {
+  br(['new', 'rm1', '--dir', home]);
+  const id = roomId('rm1');
+  br(['rm1', 'first', 'sync']);
+  br(['rm1', 'swap', 'sync']);
+  assert.match(br(['rm1', 'swap', 'rename', 'bid']).out, /you are now bid/);
+  assert.match(br(['rm1', 'bid', 'rename', 'swap']).out, /you are now swap/);
+  // A command still under the name it left: refused, and it doesn't come back as a second agent.
+  const late = br(['rm1', 'bid', 'claim', 'a.ts']);
+  assert.equal(late.code, 1);
+  assert.match(late.out + late.err, /bid renamed itself to swap/);
+  assert.ok(!(await view('rm1')).agents.some((a) => a.name === 'bid'));
+  // A name with no session behind it comes off at once, with a handoff, and never leads.
+  br(['rm1', 'ghost', 'sync']);
+  assert.deepEqual((await page('remove', { id, name: 'ghost' })).json().cleared, ['ghost']);
+  let v = await view('rm1');
+  assert.ok(!v.agents.some((a) => a.name === 'ghost'));
+  assert.ok(v.details.some((x) => x.name === 'Handoff: ghost'));
+  // A running agent is stopped first.
+  await page('start', { id, name: 'busy1', task: 'go', cap: 5, mode: 'background' });
+  await until2(async () => (await view('rm1')).agents.find((a) => a.name === 'busy1')?.live);
+  assert.deepEqual((await page('remove', { id, name: 'busy1' })).json().cleared, ['busy1']);
+  v = await view('rm1');
+  assert.ok(!v.agents.some((a) => a.name === 'busy1'));
+  assert.equal((await page('remove', { id, name: 'busy1' })).status, 404);
+});
+
+test('@ finds the project files, a pasted picture is saved for the agents, and one agent can be interrupted', async () => {
+  const proj = join(home, 'filesproj');
+  mkdirSync(join(proj, 'src'), { recursive: true });
+  writeFileSync(join(proj, 'src', 'snooze.ts'), 'x');
+  writeFileSync(join(proj, 'README.md'), 'x');
+  spawnSync('git', ['init', '-q', proj]);
+  br(['new', 'fp', '--dir', proj]);
+  const id = roomId('fp');
+  const get = (u, h = { 'x-henchmen-owner': ownerToken }) => fetch(`${origin}${u}`, { headers: h });
+  assert.equal((await get(`/api/room/${id}/files?q=snooze`, {})).status, 403);
+  assert.deepEqual((await (await get(`/api/room/${id}/files?q=snooze`)).json()).files, ['src/snooze.ts']);
+  // Built-in commands are on the / list.
+  assert.ok((await (await get(`/api/room/${id}/skills`)).json()).skills.some((x) => x.name === 'compact' && x.source === 'Claude Code'));
+  // A picture: raw bytes in, a file only the owner could have made.
+  const png = Buffer.from('89504e470d0a1a0a0000000d49484452', 'hex');
+  const up = (h) => fetch(`${origin}/upload?room=${id}`, { method: 'POST', headers: { origin, 'content-type': 'image/png', ...h }, body: png });
+  assert.equal((await up({})).status, 403);
+  assert.equal((await fetch(`${origin}/upload?room=${id}`, { method: 'POST', headers: { origin, 'content-type': 'text/html', 'x-henchmen-owner': ownerToken }, body: 'x' })).status, 403);
+  const { path } = await (await up({ 'x-henchmen-owner': ownerToken })).json();
+  assert.ok(path.startsWith(join(home, 'uploads')));
+  assert.deepEqual(readFileSync(path), png);
+  // Agents are given the uploads folder.
+  await page('start', { id, name: 'int1', task: 'go', cap: 5, mode: 'background' });
+  await until2(async () => (await view('fp')).agents.find((a) => a.name === 'int1')?.run?.status === 'idle');
+  const args = turns().filter((t) => t.args).at(-1).args;
+  assert.equal(args[args.indexOf('--add-dir') + 1], join(home, 'uploads'));
+  // Interrupt: its message comes next, as from you, and the rest of the room runs on.
+  const r = (await page('interrupt', { id, name: 'int1', body: 'drop it and check the tests' })).json();
+  await until2(() => turns().some((t) => t.text?.includes('drop it and check the tests') && t.text.includes('interrupted you')));
+  const v = await view('fp');
+  assert.ok(v.messages.some((m) => m.id === r.id && m.sender === 'human' && m.target === 'int1'));
+  assert.ok(!v.room.paused);
+  assert.equal((await page('interrupt', { id, name: 'nobody' })).status, 404);
   await page('stopAll', { id });
 });
 

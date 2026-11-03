@@ -45,9 +45,10 @@ To keep things moving later, type in the page's group chat, or say "continue" to
 
 ## What's on the page
 
-- **Report:** one page, replaced live. Whatever changed since you last looked is marked. A division's report shows up on its parent's page.
+- **Report:** one page, replaced live. Whatever changed since you last looked is marked. A division's report shows up on its parent's page. **Clean up docs** asks the leader to keep only what you need to read now, moving the rest to pages, or to hand the job to a Haiku or Sonnet subagent.
 - **Discussion:** texting with your crew. Hover any message and press **Reply**, and it goes straight to whoever wrote it, with the original quoted above your text. Click the quote to jump back. A message with no name goes to whoever's free. Naming one task sends it to that task's owner. Use `@name` for anyone else. An agent that finds the work is someone else's passes it straight to them, so nothing gets relayed. Agents write short and plain: a post over 80 words is refused, and detail goes on a linked page.
-- **The post in the middle:** your crew. The agent on top leads. Click one to see its task and spending, stop it, or open **Talk to agent**.
+- **The post in the middle:** your crew. The agent on top leads. Click one to see its task and spending, open **Talk to agent**, **Interrupt** it (like Esc: it drops the step it's on and reads your message next), stop it, or **Remove from crew**. **Subagents and steps** shows everything it's running, read from its Claude Code session: its subagents and what each is doing now, its background shells and monitors, and its latest steps.
+- **The message box:** hold Space, or press **Talk**, to dictate. The words land in the box for you to check, and Chrome's speech service writes them out. `@` offers your crew and the project's files, `/` offers your skills and Claude Code's own `/compact` and `/model`, and a pasted picture is saved where every agent can open it.
 - **The yellow band:** what needs you: permission requests, blockers and questions, from this room and its divisions.
 
 ## Starting and talking to agents
@@ -69,8 +70,8 @@ Typing `/` in the task or the group chat offers your skills, and they run the wa
 - **Claims:** an agent claims a file or task before changing it. A claim holds across the whole project, so two divisions can't collide on a file.
 - **Default instructions:** every agent gets them when it joins. Edit them per room in Room settings; divisions inherit from their parent.
 - **@everyone and Drop everything:** `@everyone` sends a message to every agent here and in the divisions below, and each does its own part. **Drop everything**, under the crew, is the override: after a small confirmation at the top of the page, it interrupts every agent mid-work, cancels queued messages and open approvals, and gives each agent only what you typed. The room then waits for your **Keep going**.
-- **Room actions:** find any message in the chat, ask the leader to catch you up, and see how much each agent is carrying. You can compact an agent's memory by hand, or have resting agents compact when they pass a limit you pick. It's off by default, because compacting loses some detail.
-- **Tabs close themselves:** when an agent finishes, leaves or is stopped, its Terminal tab closes. A tab only closes if it has nothing running and still has the agent's title, so your own tabs are safe. A crashed agent keeps its tab so you can read why. **Stop idle** ends agents that have sat idle for a minute, except the leader.
+- **Room actions:** find any message in the chat, ask the leader to catch you up, and see how much each agent is carrying. You can compact an agent's memory by hand, or have resting agents compact when they pass a limit you pick. By default Claude Code decides, compacting an agent only when its memory is nearly full; **Off** turns that off too, for agents started after.
+- **Tabs close themselves:** when an agent finishes, leaves or is stopped, its Terminal tab closes. Stopping one from the page also leaves a handoff page in Agents' files. A tab only closes if it has nothing running and still has the agent's title, so your own tabs are safe. A crashed agent keeps its tab so you can read why. **Stop idle** ends agents that have sat idle for a minute, except the leader.
 - **Agents' files:** pages agents write stay in Room settings, where you can read or delete them. Only pages an agent marks for you (`detail NAME --show`), 8 at most, appear on the report.
 - **Reports stay short:** an edit based on an old version is refused and returned with the current text, so nothing gets overwritten. A report that won't fit one page is refused, and the detail goes on a linked page.
 
@@ -82,6 +83,8 @@ Set per room in Room settings. This applies to agents started from the page.
 |---|---|
 | **Ask** (default) | Whatever your Claude Code settings allow without a prompt runs on its own. In a terminal window, anything else asks in that window and the page tells you it's waiting. In the background, it appears on the page with Approve and Deny. |
 | **Full access** | Agents run any command without asking. Only use this on a project you'd trust them to change or break. |
+
+**The kill guard** runs at every level, Full access included. Before an agent started from the page runs a shell command, Henchmen checks any `pkill`, `killall` or `kill` in it, and blocks one that would reach past what the agent started: more than 10 processes, any Claude Code session, Terminal, the Henchmen server or the agent itself, `kill -1` or a process group, a pattern the shell fills in later, or `pkill` options written after the pattern (macOS reads those as more patterns). The agent is told why, and how to stop its own process by PID or port instead.
 
 To make Full access your own default for rooms that don't set a level, put `{"default_security": "full"}` in `~/.henchmen/config.json` and restart the server. The page labels any room running at Full access.
 
@@ -109,13 +112,37 @@ On a Claude subscription, spending shows as "not reported", because there's no p
 - **Claude Code only, for now.** The room commands work for anything that can run a shell command, but only Claude agents can be started from the page.
 - **The server keeps running** until you stop it or restart your computer. Ask a session to run `henchmen stop`, and any `henchmen` command starts it again.
 - **The `henchmen` command is on the path only inside Claude Code sessions.** To use it in your own terminal, find it with `ls ~/.claude/plugins/cache/henchmen/henchmen/*/bin/henchmen`.
-- **A terminal session that goes silent counts as gone after an hour,** so a closed session can still show as leader until then. Agents started from the page leave the moment they stop.
+- **A terminal session that goes silent counts as gone after an hour,** so a closed session can still show as leader until then; **Remove from crew** on its card takes it off at once. Agents started from the page leave the moment they stop.
 
 Your rooms are stored in `~/.henchmen/`. Uninstalling the plugin leaves them there.
 
 ## Commands
 
 `henchmen help` lists everything agents and you can run.
+
+## Patch notes
+
+### 0.2.1
+
+- **Kill guard.** An agent's `pkill -f PATTERN -P 1` once stopped most of a Mac's apps, because macOS reads options after the pattern as more patterns, and `1` matched nearly everything. Every agent Henchmen starts now runs its shell commands past a guard that blocks any kill reaching beyond what the agent started, and new agents are told to stop processes by PID or port. Agents started before you update get it when they restart.
+- **Agent page:** **Subagents and steps** on each agent shows its subagents, background shells and monitors, and latest steps.
+- **Interrupt one agent** without stopping the rest of the crew, and **Remove from crew** for any single agent, running or not.
+- **Voice:** hold Space or press **Talk** to dictate a message.
+- **Message box:** `@` finds the project's files, `/` lists your plugins' skills and Claude Code's `/compact` and `/model`, and pasted pictures reach the agents.
+- **Clean up docs** under the report.
+- **Handoffs:** stopping an agent from the page leaves a handoff page.
+- **Compacting:** "Let Claude Code decide" and "Off" are separate choices.
+- **Fixes:** dragging the divider no longer scrolls the chat. A name an agent renamed away from can't come back as a second agent and take over as leader. The dark theme uses neutral greys, the crew rail is the darkest column, and Drop everything is readable.
+
+### 0.2.0
+
+- **Reply** to any message: it goes straight to whoever wrote it, quoted, and their answer links back. Agents pass work to its owner instead of relaying it. A message with no name goes to whoever's free.
+- **@everyone** reaches every agent in the room and its divisions.
+- **Drop everything** interrupts every agent after a small confirmation and holds the room until **Keep going**.
+- **Room actions:** find in chat, a catch-up from the leader, and agent memory, with compacting per agent or automatically.
+- **Reports** keep only what you should see; agents' other pages go to Agents' files, ready to delete.
+- **Terminal tabs close themselves** when their agent finishes. **Stop idle** stops agents resting over a minute.
+- **Fixes:** agents sharing a session name got each other's stops and replies; slash commands typed into a window now run; turns that end over several rows no longer lose their answers.
 
 ## Development
 

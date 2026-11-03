@@ -1,9 +1,9 @@
 // The Henchmen server: rooms, messages, leaders, tasks, reports, approvals and page-started agents.
 import http from 'node:http';
 import { randomBytes, createHash } from 'node:crypto';
-import { spawn, execFile, execFileSync } from 'node:child_process';
+import { spawn, spawnSync, execFile, execFileSync } from 'node:child_process';
 import { readFileSync, writeFileSync, mkdirSync, existsSync, rmSync, statSync, readdirSync, lstatSync, openSync, readSync, closeSync } from 'node:fs';
-import { dirname, join, extname, resolve } from 'node:path';
+import { basename, dirname, join, extname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { DatabaseSync } from 'node:sqlite';
 import { DEFAULT_INSTRUCTIONS, PAGE_AGENT_NOTE, WINDOW_AGENT_NOTE } from './defaults.mjs';
@@ -97,6 +97,7 @@ export function serve() {
     CREATE INDEX IF NOT EXISTS msg_room ON messages(room_id, id);
     CREATE TABLE IF NOT EXISTS agents(room_id INTEGER NOT NULL REFERENCES rooms(id) ON DELETE CASCADE, name TEXT, cursor INTEGER DEFAULT 0, joined_at INTEGER, seq INTEGER, seen INTEGER, left_at INTEGER, doing TEXT DEFAULT '', source TEXT DEFAULT 'terminal', told INTEGER DEFAULT 0, cleared INTEGER DEFAULT 0, PRIMARY KEY(room_id, name));
     CREATE TABLE IF NOT EXISTS claims(root_id INTEGER, what TEXT, owner TEXT, room_id INTEGER, ts INTEGER, PRIMARY KEY(root_id, what));
+    CREATE TABLE IF NOT EXISTS renames(room_id INTEGER, old TEXT, new TEXT, ts INTEGER, PRIMARY KEY(room_id, old));
     CREATE TABLE IF NOT EXISTS claim_queue(root_id INTEGER, what TEXT, agent TEXT, room_id INTEGER, ts INTEGER, PRIMARY KEY(root_id, what, agent));
     CREATE TABLE IF NOT EXISTS tasks(id INTEGER PRIMARY KEY AUTOINCREMENT, room_id INTEGER NOT NULL REFERENCES rooms(id) ON DELETE CASCADE, title TEXT, owner TEXT, status TEXT DEFAULT 'open', by TEXT, ts INTEGER);
     CREATE TABLE IF NOT EXISTS sections(room_id INTEGER NOT NULL REFERENCES rooms(id) ON DELETE CASCADE, name TEXT, body TEXT, version INTEGER, pos INTEGER, by TEXT, ts INTEGER, PRIMARY KEY(room_id, name));
@@ -223,6 +224,7 @@ export function serve() {
     sweep(r);
     const now = Date.now();
     const a = one(`SELECT * FROM agents WHERE room_id=? AND name=?`, r.id, name);
+    if (source !== 'terminal') run(`DELETE FROM renames WHERE room_id=? AND old=?`, r.id, name); // the server gave this name to a new agent
     if (!a) run(`INSERT INTO agents(room_id, name, joined_at, seq, seen, source) VALUES(?,?,?,?,?,?)`, r.id, name, now, ++seq, now, source);
     else if (a.left_at) run(`UPDATE agents SET left_at=NULL, cleared=0, joined_at=?, seq=?, seen=?, source=?, told=0 WHERE room_id=? AND name=?`, now, ++seq, now, source, r.id, name);
     else run(`UPDATE agents SET seen=? WHERE room_id=? AND name=?`, now, r.id, name);
@@ -464,7 +466,7 @@ export function serve() {
     const firstPath = join(HOME, 'runs', `${runId}.first`);
     // A skill call goes through as itself; the system prompt already says to sync first.
     writeFileSync(firstPath, task?.trim() && isSkillCall(r, task) ? task.trim() : firstPrompt({ task, role, path, name, placeholder: named.placeholder, requestedBy }), { mode: 0o600 });
-    const who = { GIT_AUTHOR_NAME: name, GIT_AUTHOR_EMAIL: `${name}@henchmen.local`, GIT_COMMITTER_NAME: name, GIT_COMMITTER_EMAIL: `${name}@henchmen.local`, HENCHMEN_PORT: String(PORT), HENCHMEN_HOME: HOME, HENCHMEN_AGENT: name };
+    const who = { GIT_AUTHOR_NAME: name, GIT_AUTHOR_EMAIL: `${name}@henchmen.local`, GIT_COMMITTER_NAME: name, GIT_COMMITTER_EMAIL: `${name}@henchmen.local`, HENCHMEN_PORT: String(PORT), HENCHMEN_HOME: HOME, HENCHMEN_AGENT: name, ...compactEnv(r.id) };
     const args = ['--name', sessionName, '--append-system-prompt-file', p.promptPath, ...sessionArgs(p, path, name)];
     const script = join(HOME, 'runs', `${runId}.sh`);
     writeFileSync(script, ['#!/bin/sh', `cd ${shq(dir)} || exit 1`, `PATH=${shq(join(ROOT, 'bin'))}:"$PATH"`, 'export PATH', ...Object.entries(who).map(([k, v]) => `export ${k}=${shq(v)}`), `exec ${shq(CLAUDE)} ${args.map(shq).join(' ')} -- "$(cat ${shq(firstPath)})"`, ''].join('\n'), { mode: 0o700 });
@@ -609,6 +611,80 @@ export function serve() {
     }
     return null;
   }
+  // What an agent is up to, from its own session file: its latest steps, and the subagents and background shells it started.
+  const stepText = (i = {}) => scrub(String(i.description || i.command || i.file_path || i.pattern || i.url || i.query || i.skill || i.prompt || '')).replace(/\s+/g, ' ').slice(0, 160);
+  function lastStep(file) {
+    try {
+      const size = statSync(file).size, want = Math.min(size, 65536), buf = Buffer.alloc(want), fd = openSync(file, 'r');
+      readSync(fd, buf, 0, want, size - want);
+      closeSync(fd);
+      for (const l of buf.toString('utf8').split('\n').reverse()) {
+        try { const b = JSON.parse(l).message?.content?.findLast?.((x) => x?.type === 'tool_use'); if (b) return `${b.name}: ${stepText(b.input)}`; } catch { /* a cut-off line */ }
+      }
+    } catch { /* no file yet */ }
+    return null;
+  }
+  function activityOf(r, name) {
+    const u = one(`SELECT * FROM runs WHERE room_id=? AND agent=? AND session IS NOT NULL ORDER BY id DESC LIMIT 1`, r.id, name);
+    const s = u && { sessionId: u.session, cwd: dirOf(r) };
+    const rows = s && sessionRows(s);
+    if (!rows) return null;
+    const live = !!liveRun(r.id, name);
+    const steps = new Map(), jobs = new Map(), byTask = new Map();
+    const END = { completed: 'finished', failed: 'failed', killed: 'stopped', stopped: 'stopped' };
+    for (const row of rows) {
+      const c = row.message?.content;
+      const ts = Date.parse(row.timestamp) || null;
+      if (row.type === 'assistant' && Array.isArray(c)) {
+        for (const b of c) {
+          if (b?.type !== 'tool_use') continue;
+          const i = b.input || {};
+          steps.set(b.id, { ts, tool: b.name, what: stepText(i), done: false });
+          if (b.name === 'Agent' || b.name === 'Task') jobs.set(b.id, { kind: 'subagent', ts, what: scrub(String(i.description || '')).slice(0, 120), type: i.subagent_type || 'general-purpose', model: i.model || null, status: 'running' });
+          else if (i.run_in_background || b.name === 'Monitor') jobs.set(b.id, { kind: b.name === 'Monitor' ? 'monitor' : 'shell', ts, what: stepText(i), status: 'running' });
+          const stopped = (b.name === 'TaskStop' || b.name === 'KillShell') && byTask.get(i.task_id || i.shell_id);
+          if (stopped) stopped.status = 'stopped';
+        }
+      }
+      if (row.type === 'user' && Array.isArray(c)) {
+        for (const b of c) {
+          if (b?.type !== 'tool_result') continue;
+          const step = steps.get(b.tool_use_id);
+          if (step) Object.assign(step, { done: true, failed: !!b.is_error });
+          const job = jobs.get(b.tool_use_id);
+          if (!job) continue;
+          const tr = row.toolUseResult || {};
+          const task = tr.backgroundTaskId || tr.taskId || (tr.status === 'async_launched' && tr.agentId);
+          if (task && !b.is_error) { byTask.set(task, job); if (tr.agentId) job.agentId = tr.agentId; } else job.status = b.is_error ? 'failed' : 'finished';
+          if (tr.resolvedModel) job.model = tr.resolvedModel;
+        }
+      }
+      if (['user', 'attachment', 'queue-operation'].includes(row.type)) {
+        const text = typeof c === 'string' ? c : JSON.stringify(row);
+        if (!text.includes('<task-notification>')) continue;
+        for (const m of text.matchAll(/<task-id>([\w-]+)<\/task-id>[\s\S]*?<status>(\w+)<\/status>/g)) {
+          const job = byTask.get(m[1]);
+          if (job) job.status = END[m[2]] || m[2];
+        }
+      }
+    }
+    const all = [...jobs.values()];
+    for (const j of all) if (!live && j.status === 'running') j.status = 'ended'; // its session is over, and they went with it
+    // A running subagent's own file says what it's doing now.
+    const dir = join(process.env.HOME || '', '.claude', 'projects', s.cwd.replace(/[^a-zA-Z0-9]/g, '-'), s.sessionId, 'subagents');
+    const running = all.filter((j) => j.kind === 'subagent' && j.status === 'running');
+    if (running.length && existsSync(dir)) {
+      const ids = new Map();
+      for (const f of readdirSync(dir)) {
+        if (!f.endsWith('.meta.json')) continue;
+        try { const meta = JSON.parse(readFileSync(join(dir, f), 'utf8')); if (meta.toolUseId) ids.set(meta.toolUseId, f.replace(/\.meta\.json$/, '')); } catch { /* still being written */ }
+      }
+      for (const [id, j] of jobs) if (running.includes(j)) { const f = ids.get(id) || (j.agentId && `agent-${j.agentId}`); j.now = f ? lastStep(join(dir, `${f}.jsonl`)) : null; }
+    }
+    const order = (x) => (x.status === 'running' ? 0 : 1);
+    const pick = (kind) => all.filter((j) => (kind === 'subagent' ? j.kind === 'subagent' : j.kind !== 'subagent')).sort((a, b) => order(a) - order(b) || b.ts - a.ts).slice(0, 12).map(({ agentId, ...j }) => j);
+    return { live, subagents: pick('subagent'), shells: pick('shell'), steps: [...steps.values()].slice(-25).reverse().map((x) => ({ ...x, running: live && !x.done })) };
+  }
   const COMPACT_TURN = '/compact Keep what matters for your current work: decisions, file names, open tasks, and who holds what.';
   function compactAgent(p) {
     p.compacted = Date.now();
@@ -622,7 +698,7 @@ export function serve() {
     try {
       for (const p of [...procs.values()]) {
         const r = room(p.roomId);
-        if (!r?.compact_at || r.paused || !(p.context >= r.compact_at)) continue;
+        if (!(r?.compact_at > 0) || r.paused || !(p.context >= r.compact_at)) continue;
         if (restingFor(p) < IDLE_MS * 2 || Date.now() - (p.compacted ?? 0) < 1800000) continue;
         insert(r, 'system', null, 'note', `Compacted ${p.agent}'s memory, which had reached about ${Math.round(p.context / 1000)}k tokens.`);
         compactAgent(p);
@@ -697,7 +773,7 @@ export function serve() {
     }
     let child;
     try {
-      child = spawn(CLAUDE, args, { cwd: dir, env: agentEnv(name), stdio: ['pipe', 'pipe', 'pipe'] });
+      child = spawn(CLAUDE, args, { cwd: dir, env: { ...agentEnv(name), ...compactEnv(p.roomId) }, stdio: ['pipe', 'pipe', 'pipe'] });
     } catch (e) {
       procs.delete(p.runId);
       run(`UPDATE runs SET status='crashed', why=?, ended=? WHERE id=?`, `Couldn't start claude: ${e.code || 'error'}`, Date.now(), p.runId);
@@ -738,12 +814,17 @@ export function serve() {
     });
   }
   // What the headless engine and the full terminal screen share, so handing over changes nothing about the agent.
+  const UPLOADS = join(HOME, 'uploads');
+  mkdirSync(UPLOADS, { recursive: true, mode: 0o700 }); // agents are given it at start, so it has to exist
   function sessionArgs(p, path, name) {
     // The room rather than the agent's name, because agents rename themselves. Names are on trust either way.
     const a = ['--allowedTools', `Bash(henchmen ${path}:*)`, 'Bash(henchmen help)', 'Bash(henchmen list)'];
     if (p.model) a.push('--model', p.model);
     if (p.effort) a.push('--effort', p.effort);
+    a.push('--add-dir', UPLOADS); // pictures the human pastes into the chat
     if (securityOf(room(p.roomId)) === 'full') a.push('--permission-mode', 'bypassPermissions');
+    // Every command first passes the kill guard, which stops a kill that would reach past what the agent started. It runs in Full access too.
+    a.push('--settings', JSON.stringify({ hooks: { PreToolUse: [{ matcher: 'Bash|Monitor', hooks: [{ type: 'command', command: `${shq(process.execPath)} ${shq(join(ROOT, 'src', 'guard.mjs'))}` }] }] } }));
     return a;
   }
   function agentEnv(name) {
@@ -754,6 +835,8 @@ export function serve() {
     if (process.env.HENCHMEN_DB) env.HENCHMEN_DB = process.env.HENCHMEN_DB;
     return env;
   }
+  // Compacting set to Off in Room actions turns off Claude Code's own as well, for agents started after.
+  const compactEnv = (roomId) => (room(roomId)?.compact_at < 0 ? { DISABLE_AUTO_COMPACT: '1' } : {});
   const tell = (p, line) => {
     // This text lands in the person's real terminal, so nothing an agent writes may act as a terminal control code.
     const text = `${scrub(line)}\n`;
@@ -829,21 +912,42 @@ export function serve() {
     return { opened: true, command };
   }
 
+  // ---------- files, for @ in the message box ----------
+  const fileCache = new Map(); // folder -> { at, list }
+  function filesOf(r) {
+    const dir = dirOf(r);
+    if (!dir || !existsSync(dir)) return [];
+    const c = fileCache.get(dir);
+    if (c && Date.now() - c.at < 60000) return c.list;
+    // git knows which files are the project's; a folder without git has none to offer.
+    const g = spawnSync('git', ['-C', dir, 'ls-files', '--cached', '--others', '--exclude-standard'], { encoding: 'utf8', maxBuffer: 64e6, timeout: 5000 });
+    const list = g.status === 0 ? [...new Set(g.stdout.split('\n').filter(Boolean))] : [];
+    fileCache.set(dir, { at: Date.now(), list });
+    return list;
+  }
+  function findFiles(r, query) {
+    const q = String(query ?? '').toLowerCase();
+    const base = (f) => f.slice(f.lastIndexOf('/') + 1).toLowerCase();
+    return filesOf(r).filter((f) => f.toLowerCase().includes(q)).sort((a, b) => base(b).startsWith(q) - base(a).startsWith(q) || a.length - b.length).slice(0, 12);
+  }
+
   // ---------- skills ----------
   const skillCache = new Map(); // rootId -> names reported by agents' Claude Code
   const SKILL_NAME = /^[\w.:-]{1,64}$/;
   function diskSkills(folder) {
     const out = [];
-    for (const [base, source] of [[join(process.env.HOME || '', '.claude', 'skills'), 'yours'], [folder && join(folder, '.claude', 'skills'), 'this project']]) {
+    for (const [base, source, prefix = '', single] of [[join(process.env.HOME || '', '.claude', 'skills'), 'yours'], [folder && join(folder, '.claude', 'skills'), 'this project'], ...pluginSkillDirs()]) {
       if (!base || !existsSync(base)) continue;
-      for (const name of readdirSync(base)) {
+      for (const name of single ? [''] : readdirSync(base)) { // a single entry is one skill's own folder
         try {
-          const file = join(base, name, 'SKILL.md');
+          const command = source === 'plugin command';
+          if (command && !name.endsWith('.md')) continue;
+          const file = command ? join(base, name) : join(base, name, 'SKILL.md');
           // A project's files are untrusted: no links out, and only an ordinary small file gets read, or a pipe could freeze the server.
-          const info = source === 'yours' ? statSync(file) : lstatSync(file);
+          const info = source === 'this project' ? lstatSync(file) : statSync(file);
           if (!info.isFile() || info.size > 256_000) continue;
           const head = readFileSync(file, 'utf8').slice(0, 2000);
-          const skillName = head.match(/^name:\s*["']?([^"'\n]+)/m)?.[1]?.trim() || name;
+          const skillName = prefix + ((!command && head.match(/^name:\s*["']?([^"'\n]+)/m)?.[1]?.trim()) || (name || basename(base)).replace(/\.md$/, ''));
           if (!SKILL_NAME.test(skillName) || out.some((x) => x.name === skillName)) continue; // yours come first, so a project can't replace one
           const description = head.match(/^description:\s*["']?([^\n]+)/m)?.[1]?.replace(/["']$/, '').trim() || '';
           out.push({ name: skillName, description: scrub(description).slice(0, 140), source });
@@ -852,13 +956,34 @@ export function serve() {
     }
     return out;
   }
+  // Skills and commands of the plugins you've turned on in Claude Code, named plugin:skill as Claude Code names them.
+  function pluginSkillDirs() {
+    const home = join(process.env.HOME || '', '.claude');
+    try {
+      const on = JSON.parse(readFileSync(join(home, 'settings.json'), 'utf8')).enabledPlugins || {};
+      const installed = JSON.parse(readFileSync(join(home, 'plugins', 'installed_plugins.json'), 'utf8')).plugins || {};
+      return Object.keys(on).filter((k) => on[k] === true && installed[k]?.[0]?.installPath).flatMap((k) => {
+        const dir = installed[k].at(-1).installPath, prefix = `${k.split('@')[0]}:`;
+        // A plugin may list its skill folders itself; otherwise they're the folders in skills/.
+        let listed;
+        try { listed = JSON.parse(readFileSync(join(dir, '.claude-plugin', 'plugin.json'), 'utf8')).skills; } catch { /* no manifest */ }
+        const skills = Array.isArray(listed) ? listed.filter((x) => typeof x === 'string').map((x) => [resolve(dir, x), 'plugin', prefix, true]) : [[join(dir, 'skills'), 'plugin', prefix]];
+        return [...skills, [join(dir, 'commands'), 'plugin command', prefix]];
+      });
+    } catch { return []; }
+  }
   // Only a real skill or command goes through as one; "/etc/hosts is wrong" is just a message.
   const isSkillCall = (r, text) => {
     const name = String(text).trim().match(/^\/([\w.:-]+)/)?.[1];
     return !!name && skillsFor(r).some((x) => x.name === name);
   };
+  // Claude Code's own commands that make sense sent to an agent from the chat.
+  const BUILT_IN = [
+    { name: 'compact', description: "Summarize the agent's memory so its turns cost less. Add what to keep after it.", source: 'Claude Code' },
+    { name: 'model', description: 'Switch the agent to another model, like /model sonnet. Works for agents in their own tab.', source: 'Claude Code' },
+  ];
   function skillsFor(r) {
-    const found = new Map(diskSkills(dirOf(r)).map((x) => [x.name, x]));
+    const found = new Map([...BUILT_IN, ...diskSkills(dirOf(r))].map((x) => [x.name, x]));
     for (const name of skillCache.get(rootOf(r).id) ?? []) if (!found.has(name)) found.set(name, { name, description: '', source: 'Claude Code' });
     return [...found.values()].sort((a, b) => a.name.localeCompare(b.name));
   }
@@ -1222,6 +1347,10 @@ export function serve() {
       if (one(`SELECT 1 x FROM agents WHERE room_id=? AND name=?`, r.id, next)) throw new Refuse(409, `${next} is already taken here. Pick another.`);
       const root = rootOf(r).id;
       run(`UPDATE agents SET name=? WHERE room_id=? AND name=?`, next, r.id, a.name);
+      // The old name points at the new one, so a command still sent under it can't bring the old name back as a second agent.
+      run(`DELETE FROM renames WHERE room_id=? AND old=?`, r.id, next);
+      run(`UPDATE renames SET new=? WHERE room_id=? AND new=?`, next, r.id, a.name);
+      run(`INSERT OR REPLACE INTO renames(room_id, old, new, ts) VALUES(?,?,?,?)`, r.id, a.name, next, Date.now());
       run(`UPDATE runs SET agent=? WHERE room_id=? AND agent=?`, next, r.id, a.name);
       run(`UPDATE tasks SET owner=? WHERE room_id=? AND owner=?`, next, r.id, a.name);
       run(`UPDATE claims SET owner=? WHERE root_id=? AND owner=? AND room_id=?`, next, root, a.name, r.id);
@@ -1500,7 +1629,7 @@ export function serve() {
   }
 
   // A handoff is built only from the record: what the agent said it was doing, its tasks, and its own posts.
-  function handoffFor(r, a, released, freed) {
+  function handoffFor(r, a, released, freed, how = 'cleared') {
     const when = (ts) => new Date(ts).toISOString().slice(0, 16).replace('T', ' ');
     const u = one(`SELECT * FROM runs WHERE room_id=? AND agent=? ORDER BY id DESC LIMIT 1`, r.id, a.name);
     const posts = q(`SELECT * FROM messages WHERE room_id=? AND sender=? AND from_room IS NULL ORDER BY id`, r.id, a.name);
@@ -1508,26 +1637,36 @@ export function serve() {
     const results = posts.filter((m) => ['done', 'decision', 'blocked', 'answer'].includes(m.kind)).slice(-12).reverse();
     const hashes = [...new Set(posts.filter((m) => m.kind === 'done').flatMap((m) => m.body.match(/\b(?=[0-9a-f]*[a-f])(?=[0-9a-f]*\d)[0-9a-f]{7,40}\b/g) ?? []))];
     const unread = q(`SELECT * FROM messages WHERE room_id=? AND id>? AND sender<>? AND (target=? OR target='all' OR sender='human') ORDER BY id DESC LIMIT 10`, r.id, a.cursor, a.name, a.name).reverse();
-    const out = [`Built from the room's record when ${a.name} was cleared on ${when(Date.now())}. Last active ${when(a.seen)}. ${posts.length} posts in this room.`];
+    const out = [`Built from the room's record when ${a.name} was ${how} on ${when(Date.now())}. Last active ${when(a.seen)}. ${posts.length} posts in this room.`];
     if (a.doing) out.push(`**Last status:** ${oneLine(a.doing)}`);
     if (u?.task) out.push(`**Task it was started with:** ${oneLine(u.task)}`);
     if (u?.status && ['crashed', 'capped'].includes(u.status)) out.push(`**How it ended:** ${u.status}: ${oneLine(u.why)}`);
     if (u?.session) out.push(`**Claude session:** \`${u.session}\``);
-    if (freed.length) out.push(`## Unfinished tasks, now unassigned\n${freed.map((t) => `- ${t.id}: ${oneLine(t.title)} (was ${t.status})`).join('\n')}`);
+    if (freed.length) out.push(`## Unfinished tasks, ${how === 'stopped' ? 'still assigned to it' : 'now unassigned'}\n${freed.map((t) => `- ${t.id}: ${oneLine(t.title)} (was ${t.status})`).join('\n')}`);
     const closed = mine.filter((t) => ['finished', 'done'].includes(t.status));
     if (closed.length) out.push(`## Tasks it finished\n${closed.map((t) => `- ${t.id}: ${oneLine(t.title)}${t.status === 'finished' ? ' (the leader has not closed it)' : ''}`).join('\n')}`);
-    if (released.length) out.push(`## Claims released\n${released.map((c) => `- ${oneLine(c)}`).join('\n')}`);
+    if (released.length) out.push(`## ${how === 'stopped' ? 'Claims it still holds' : 'Claims released'}\n${released.map((c) => `- ${oneLine(c)}`).join('\n')}`);
     if (hashes.length) out.push(`## Commits it reported\n${hashes.map((h) => `\`${h}\``).join(', ')}`);
     if (results.length) out.push(`## Its latest results, newest first\n${results.map((m) => `- #${m.id} ${when(m.ts)} ${m.kind}: ${oneLine(m.body).slice(0, 500)}`).join('\n')}`);
     if (unread.length) out.push(`## Sent to it and never read\n${unread.map((m) => `- #${m.id} from ${m.sender}: ${oneLine(m.body).slice(0, 300)}`).join('\n')}`);
     out.push(`If it comes back, it rejoins with its read position by running sync as ${a.name}.`);
     return scrub(out.join('\n\n')).slice(0, MAX_DETAIL);
   }
+  // Stopping from the page leaves a handoff too, under the same name, so clearing it later replaces this one.
+  function stopWithHandoff(p, why) {
+    stopRun(p, why);
+    const r = room(p.roomId);
+    const a = r && one(`SELECT * FROM agents WHERE room_id=? AND name=?`, r.id, p.agent);
+    if (!a) return;
+    const held = q(`SELECT what FROM claims WHERE root_id=? AND owner=? AND room_id=?`, rootOf(r).id, a.name, r.id).map((c) => c.what);
+    const open = q(`SELECT * FROM tasks WHERE room_id=? AND owner=? AND status IN ('open','doing','blocked','proposed') ORDER BY id`, r.id, a.name);
+    saveDetail(r.id, `Handoff: ${a.name}`, handoffFor(r, a, held, open, 'stopped'), 'system');
+  }
   // Gone agents leave the crew's view, each leaving a handoff page. Nothing here closes a session, so anyone can return.
-  function clearGone(r) {
+  function clearGone(r, only) {
     sweep(r);
     const root = rootOf(r).id;
-    const gone = q(`SELECT * FROM agents WHERE room_id=? AND left_at IS NOT NULL AND cleared=0 ORDER BY seq`, r.id).filter((a) => !liveRun(r.id, a.name));
+    const gone = q(`SELECT * FROM agents WHERE room_id=? AND left_at IS NOT NULL AND cleared=0 ORDER BY seq`, r.id).filter((a) => !liveRun(r.id, a.name) && (!only || a.name === only));
     for (const a of gone) {
       const released = q(`SELECT what FROM claims WHERE root_id=? AND owner=? AND room_id=?`, root, a.name, r.id).map((c) => c.what);
       const freed = q(`SELECT * FROM tasks WHERE room_id=? AND owner=? AND status IN ('open','doing','blocked','proposed') ORDER BY id`, r.id, a.name);
@@ -1668,14 +1807,14 @@ export function serve() {
     stop({ id, name }) {
       const p = liveRun(Number(id), name);
       if (!p) throw new Refuse(404, `${name} isn't running`);
-      stopRun(p, 'Stopped from the page');
+      stopWithHandoff(p, 'Stopped from the page');
       return { ok: true };
     },
     stopAll({ id }) {
       const r = need(id);
       let n = 0;
       stoppingAll = true;
-      for (const x of subtree(r)) for (const p of [...procs.values()]) if (p.roomId === x.id) { stopRun(p, 'Stop all from the page'); n++; }
+      for (const x of subtree(r)) for (const p of [...procs.values()]) if (p.roomId === x.id) { stopWithHandoff(p, 'Stop all from the page'); n++; }
       stoppingAll = false;
       return { stopped: n };
     },
@@ -1723,6 +1862,29 @@ export function serve() {
       }
       return { interrupted, told };
     },
+    // Esc for one agent: whatever it's doing stops, and this message is its next turn. The room keeps running.
+    interrupt({ id, name, body }) {
+      const r = need(id);
+      const p = liveRun(r.id, name);
+      if (!p) throw new Refuse(404, `${name} isn't running from this page.`);
+      body = scrub(String(body ?? '').trim() || "Stop what you're doing and wait for me.");
+      capped(body, MAX_MESSAGE, 'message');
+      audit(r.id, 'human', `interrupt ${name}`);
+      for (const it of [p.item, ...(p.directs ?? [])]) if (it) run(`UPDATE messages SET handled=3 WHERE id=? AND handled IN (0,1)`, it.id);
+      const m = { id: Number(run(`INSERT INTO messages(room_id, sender, target, kind, body, ts) VALUES(?,?,?,?,?,?)`, r.id, 'human', name, 'human', body, Date.now()).lastInsertRowid) };
+      const text = `Message from your user to you, and it overrides what you were doing: ${body}\n(Message #${m.id}. Your user interrupted you. Drop the step you were on and do only what this asks, then end your turn. If it asks nothing of you, end your turn with exactly (no reply).)`;
+      run(`UPDATE agents SET cursor=MAX(cursor, ?) WHERE room_id=? AND name=?`, m.id, r.id, name);
+      const busy = one(`SELECT status FROM runs WHERE id=?`, p.runId)?.status !== 'idle';
+      p.heldTurns = [];
+      p.item = null;
+      p.directs = [{ id: m.id, at: Date.now() }];
+      let interrupted = false;
+      if (p.window) { if (busy && interruptWindow(p, text)) interrupted = true; else typeInto(p, text); } else {
+        if (busy && p.child?.stdin.writable) { p.child.stdin.write(JSON.stringify({ type: 'control_request', request_id: `int-${m.id}-${p.runId}`, request: { subtype: 'interrupt' } }) + '\n'); interrupted = true; }
+        writeTurn(p, text);
+      }
+      return { interrupted, id: m.id };
+    },
     compact({ id, name }) {
       const r = need(id);
       const list = [...procs.values()].filter((p) => p.roomId === r.id && (!name || p.agent === name) && restingFor(p) >= 0);
@@ -1731,7 +1893,7 @@ export function serve() {
     },
     compactAt({ id, tokens }) {
       const r = need(id);
-      run(`UPDATE rooms SET compact_at=? WHERE id=?`, Math.max(0, Math.floor(Number(tokens) || 0)), r.id);
+      run(`UPDATE rooms SET compact_at=? WHERE id=?`, Math.max(-1, Math.floor(Number(tokens) || 0)), r.id); // -1 is off, 0 leaves it to Claude Code
       audit(r.id, 'human', `compact limit ${tokens}`);
       return { ok: true };
     },
@@ -1739,7 +1901,7 @@ export function serve() {
       const r = need(id);
       const idle = [...procs.values()].filter((p) => p.roomId === r.id && p.agent !== room(r.id).leader && !p.item && !p.directs?.length && one(`SELECT status FROM runs WHERE id=?`, p.runId)?.status === 'idle' && Date.now() - (p.freeSince ?? p.born ?? 0) >= IDLE_MS);
       stoppingAll = true;
-      for (const p of idle) stopRun(p, 'Idle, stopped from the page');
+      for (const p of idle) stopWithHandoff(p, 'Idle, stopped from the page');
       stoppingAll = false;
       return { stopped: idle.length };
     },
@@ -1748,6 +1910,18 @@ export function serve() {
       return { ok: true };
     },
     clearGone({ id }) { return clearGone(need(id)); },
+    // Takes one agent off the crew, whatever state it's in: a running one is stopped first (its tab closes),
+    // and each leaves a handoff. A session in a terminal Henchmen didn't open rejoins if it runs another command.
+    remove({ id, name }) {
+      const r = need(id);
+      const a = one(`SELECT * FROM agents WHERE room_id=? AND name=? AND cleared=0`, r.id, name);
+      if (!a) throw new Refuse(404, `${name} isn't on the crew here.`);
+      audit(r.id, 'human', `removed ${name}`);
+      const p = liveRun(r.id, name);
+      if (p) stopRun(p, 'Removed from the crew from the page');
+      if (!a.left_at) markLeft(r, name, false);
+      return clearGone(r, name);
+    },
     answerRequest({ id, approve }) {
       const a = one(`SELECT * FROM agent_requests WHERE id=?`, Number(id));
       if (!a) throw new Refuse(404, 'no such request');
@@ -1883,6 +2057,14 @@ export function serve() {
               if (!isOwner(req)) throw new Refuse(403, 'forbidden');
               return json(200, { skills: skillsFor(r) });
             }
+            if (parts[3] === 'files') {
+              if (!isOwner(req)) throw new Refuse(403, 'forbidden');
+              return json(200, { files: findFiles(r, url.searchParams.get('q')) });
+            }
+            if (parts[3] === 'activity') {
+              if (!isOwner(req)) throw new Refuse(403, 'forbidden');
+              return json(200, activityOf(r, String(url.searchParams.get('name') ?? '')) || { none: true });
+            }
             if (parts[3] === 'search') {
               const text = String(url.searchParams.get('q') ?? '').trim();
               if (!text) return json(200, { results: [] });
@@ -1924,6 +2106,20 @@ export function serve() {
       }
 
       // The owner's browser: its token, its own origin, JSON only.
+      // A picture pasted into the message box, saved where every agent can read it.
+      if (parts[0] === 'upload') {
+        const ext = { 'image/png': 'png', 'image/jpeg': 'jpg', 'image/gif': 'gif', 'image/webp': 'webp' }[req.headers['content-type']];
+        if (!ownOrigin(req.headers.origin) || !isOwner(req) || !ext) throw new Refuse(403, 'forbidden');
+        const r = need(url.searchParams.get('room'));
+        const chunks = [];
+        let size = 0;
+        for await (const c of req) { if ((size += c.length) > 12_000_000) throw new Refuse(413, 'That picture is over 12 MB. Save it to a file and paste its path instead.'); chunks.push(c); }
+        mkdirSync(UPLOADS, { recursive: true, mode: 0o700 });
+        const path = join(UPLOADS, `${r.id}-${Date.now()}-${randomBytes(3).toString('hex')}.${ext}`);
+        writeFileSync(path, Buffer.concat(chunks), { mode: 0o600 });
+        audit(r.id, 'human', `uploaded ${basename(path)}`);
+        return json(200, { path });
+      }
       if (parts[0] === 'h') {
         if (!ownOrigin(req.headers.origin) || !isOwner(req) || !String(req.headers['content-type']).startsWith('application/json')) throw new Refuse(403, 'forbidden');
         if (!Object.hasOwn(human, parts[1])) throw new Refuse(404, 'not found');
@@ -2011,7 +2207,7 @@ export function serve() {
             p.terminal = { token, pid: null };
             // Only what the agent's session needs. The rest of the server's environment, API keys included, stays here.
             const { GIT_AUTHOR_NAME, GIT_AUTHOR_EMAIL, GIT_COMMITTER_NAME, GIT_COMMITTER_EMAIL, HENCHMEN_PORT, HENCHMEN_HOME, HENCHMEN_AGENT } = agentEnv(p.agent);
-            json(200, { session: u.session, cwd: dirOf(r), token, bin: join(ROOT, 'bin'), args: sessionArgs(p, pathOf(r), p.agent), env: { GIT_AUTHOR_NAME, GIT_AUTHOR_EMAIL, GIT_COMMITTER_NAME, GIT_COMMITTER_EMAIL, HENCHMEN_PORT, HENCHMEN_HOME, HENCHMEN_AGENT } });
+            json(200, { session: u.session, cwd: dirOf(r), token, bin: join(ROOT, 'bin'), args: sessionArgs(p, pathOf(r), p.agent), env: { GIT_AUTHOR_NAME, GIT_AUTHOR_EMAIL, GIT_COMMITTER_NAME, GIT_COMMITTER_EMAIL, HENCHMEN_PORT, HENCHMEN_HOME, HENCHMEN_AGENT, ...compactEnv(p.roomId) } });
           };
           if (!p.child) return answer();
           p.handingOver = true;
@@ -2037,6 +2233,9 @@ export function serve() {
       if (parts[0] !== 'c') throw new Refuse(404, 'not found');
 
       const r = resolvePath(args.room);
+      // A name its agent renamed away from in the last day stays its: commands under it are refused, not a new agent.
+      const moved = !one(`SELECT 1 x FROM agents WHERE room_id=? AND name=?`, r.id, args.agent) && one(`SELECT new FROM renames WHERE room_id=? AND old=? AND ts>?`, r.id, args.agent, Date.now() - 864e5);
+      if (moved) throw new Refuse(409, `REFUSED: ${args.agent} renamed itself to ${moved.new}, so nothing ran. If that's you, use: henchmen ${pathOf(r)} ${moved.new} ${args.cmd}. If you're someone new, pick another name.`);
       if (args.cmd === 'wait') {
         const a = touch(r, args.agent);
         return waitFor(r, a.name, args.secs, res);
