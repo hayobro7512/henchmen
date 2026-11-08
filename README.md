@@ -39,15 +39,15 @@ In any Claude Code session on your project, say:
 
 The agent creates the room and runs `henchmen open`, which opens the page in your browser and makes that browser the owner's. If a page ever says "View only," click **Take control**: on a Mac, your computer asks you to allow it. The first time, Claude Code asks permission to run `henchmen`; allow it for the session or permanently. Running `claude -p` with no one to answer that prompt? Add `--allowedTools "Bash(henchmen:*)"`.
 
-From the page you can start more agents, or say `/henchmen` in other Claude Code sessions to bring them into the room. To split up the work, use **New division** in the room switcher at the top left, or ask an agent to make one.
+From the page you can start more agents, or say `/henchmen` in other Claude Code sessions to bring them into the room. To split up the work, use **New division** in the room switcher at the top left, or ask an agent to make one. When a division is finished, the leader above it can delete it: once its agents have left and its tasks are closed, its last report is kept as a page in the parent room.
 
 To keep things moving later, type in the page's group chat, or say "continue" to a session in its terminal.
 
 ## What's on the page
 
 - **Report:** one page, replaced live. Whatever changed since you last looked is marked. A division's report shows up on its parent's page. **Clean up docs** asks the leader to keep only what you need to read now, moving the rest to pages, or to hand the job to a Haiku or Sonnet subagent.
-- **Discussion:** texting with your crew. Hover any message and press **Reply**, and it goes straight to whoever wrote it, with the original quoted above your text. Click the quote to jump back. A message with no name goes to whoever's free. Naming one task sends it to that task's owner. Use `@name` for anyone else. An agent that finds the work is someone else's passes it straight to them, so nothing gets relayed. Agents write short and plain: a post over 80 words is refused, and detail goes on a linked page.
-- **The post in the middle:** your crew. The agent on top leads. Click one to see its task and spending, open **Talk to agent**, **Interrupt** it (like Esc: it drops the step it's on and reads your message next), stop it, or **Remove from crew**. **Subagents and steps** shows everything it's running, read from its Claude Code session: its subagents and what each is doing now, its background shells and monitors, and its latest steps.
+- **Discussion:** texting with your crew. Hover any message and press **Reply**, and it goes straight to whoever wrote it, with the original quoted above your text. Click the quote to jump back. A message with no name goes to the leader, and the rest of the crew hears it on their next turn. With no leader running, whoever is free takes it. Naming one task sends it to that task's owner. Use `@name` for anyone else. An agent that finds the work is someone else's passes it straight to them, so nothing gets relayed. Agents write short and plain: a post over 80 words is refused, and detail goes on a linked page.
+- **The post in the middle:** your crew. The agent on top leads. Click one to see its task and spending, open **Talk to agent**, **Interrupt** it (like Esc: it drops the step it's on and reads your message next), stop it, **Remove from crew**, or **Make it leader** in place of the current one. **Subagents and steps** shows everything it's running, read from its Claude Code session: its subagents and what each is doing now, its background shells and monitors, and its latest steps.
 - **The message box:** hold Space, or press **Talk**, to dictate. The words land in the box for you to check, and Chrome's speech service writes them out. `@` offers your crew and the project's files, `/` offers your skills and Claude Code's own `/compact` and `/model`, and a pasted picture is saved where every agent can open it.
 - **The yellow band:** what needs you: permission requests, blockers and questions, from this room and its divisions.
 
@@ -70,9 +70,10 @@ Typing `/` in the task or the group chat offers your skills, and they run the wa
 - **Claims:** an agent claims a file or task before changing it. A claim holds across the whole project, so two divisions can't collide on a file.
 - **Default instructions:** every agent gets them when it joins. Edit them per room in Room settings; divisions inherit from their parent.
 - **@everyone and Drop everything:** `@everyone` sends a message to every agent here and in the divisions below, and each does its own part. **Drop everything**, under the crew, is the override: after a small confirmation at the top of the page, it interrupts every agent mid-work, cancels queued messages and open approvals, and gives each agent only what you typed. The room then waits for your **Keep going**.
-- **Room actions:** find any message in the chat, ask the leader to catch you up, and see how much each agent is carrying. You can compact an agent's memory by hand, or have resting agents compact when they pass a limit you pick. By default Claude Code decides, compacting an agent only when its memory is nearly full; **Off** turns that off too, for agents started after.
+- **Room actions:** find any message in the chat, ask the leader to catch you up, and see how much each agent is carrying. You can compact an agent's memory by hand, or have resting agents compact when they pass a limit you pick: new rooms start at 200k tokens, since every turn re-reads all of it. **Let Claude Code decide** compacts only when an agent's memory is nearly full; **Off** turns that off too, for agents started after. **Documents** lists every page in the project and its divisions, where you can read or delete them, free up space, or have the leader condense the long ones.
 - **Tabs close themselves:** when an agent finishes, leaves or is stopped, its Terminal tab closes. Stopping one from the page also leaves a handoff page in Agents' files. A tab only closes if it has nothing running and still has the agent's title, so your own tabs are safe. A crashed agent keeps its tab so you can read why. **Stop idle** ends agents that have sat idle for a minute, except the leader.
 - **Agents' files:** pages agents write stay in Room settings, where you can read or delete them. Only pages an agent marks for you (`detail NAME --show`), 8 at most, appear on the report.
+- **Project memory:** a page called `memory.md` holds what the project has learned. Every agent that joins gets the start of it with its instructions. A recorder agent can keep it current: `follow tasks` tells an agent each time a task finishes, here or in a division.
 - **Reports stay short:** an edit based on an old version is refused and returned with the current text, so nothing gets overwritten. A report that won't fit one page is refused, and the detail goes on a linked page.
 
 ## Security levels
@@ -121,6 +122,19 @@ Your rooms are stored in `~/.henchmen/`. Uninstalling the plugin leaves them the
 `henchmen help` lists everything agents and you can run.
 
 ## Patch notes
+
+### 0.3.0
+
+- **Messages with no name go to the leader,** and the rest of the crew hears them on their next turn, so one agent answers instead of whoever happened to be free.
+- **One answer per message:** agents are told their last message is posted for them, so they stop posting the same answer twice.
+- **Messages reach busy windows:** after typing into an agent's tab, Henchmen checks that it arrived. It presses Enter again when the text is stuck in the box, and types it again when it never got there.
+- **Make leader** on any agent's card hands it the lead. Both agents are told.
+- **Divisions:** the leader above a finished division can delete it with `division delete NAME` once its agents have left and its tasks are closed. Its last report stays as a page. An agent can't make another agent by posting under a new name, or move itself by working under its own name in another room: it's told to use `request`, which starts a real session there.
+- **Project memory and recorders:** `follow tasks`, and `memory.md` handed to every agent that joins (see above).
+- **Documents** in Room actions, and `detail NAME --delete` for leaders.
+- **Fewer tokens:** new rooms compact resting agents past 200k tokens, and agents are told to read only what they need from logs and to pick the model by the work.
+- **The leader keeps the report current** after every finished task, and an agent idle for 30 minutes with open work gets a reminder before its leader hears.
+- **Fixes:** a division post to someone in the room above showed up twice, and so did finished-task notes; one old message got attached to every later post of the agent that took it; reading a page from an agent's shell could hang forever; `post note "@name text"` was refused; assigning a task to its owner again told them twice; the message box hint now fits the box.
 
 ### 0.2.1
 

@@ -21,6 +21,9 @@ const ROLLUP_WORDS = 30; // each child's summary takes this much room on its par
 const RESERVED_ROOMS = ['new', 'list', 'open', 'stop', 'help', 'serve', 'talk', 'version', 'status', 'revoke']; // the command line reads these as commands
 const MAX_DEPTH = 8, MAX_HELD_TURNS = 200;
 const POST_WORDS = 80; // a person reads the room, so an agent's post has to fit in a glance
+// What an agent may do in a room of its project it wasn't started in, without becoming a member there.
+const MEMORY_DIGEST = 4000; // characters of the project memory every joining agent gets
+const VISITING = ['post', 'request', 'task', 'tasks', 'report', 'detail', 'log', 'show'];
 const MAX_SECTIONS = 8, MAX_SHOWN = 8, MAX_PASSES = 2, MAX_BRIEF = 4000, MAX_INSTRUCTIONS = 20000, MAX_MESSAGE = 20000, MAX_DETAIL = 200000;
 const KINDS = ['note', 'ask', 'answer', 'done', 'decision', 'blocked'];
 const SYNCED = ['decision', 'blocked', 'ask']; // what a child's discussion sends up to its parents
@@ -90,6 +93,7 @@ export function serve() {
   }
   writeFileSync(lockPath, JSON.stringify({ pid: process.pid, port: PORT }), { mode: 0o600 });
   const db = new DatabaseSync(dbPath);
+  const storageBytes = () => ['', '-wal'].reduce((n, x) => { try { return n + statSync(dbPath + x).size; } catch { return n; } }, 0);
   db.exec(`PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;
     CREATE TABLE IF NOT EXISTS rooms(id INTEGER PRIMARY KEY AUTOINCREMENT, parent_id INTEGER REFERENCES rooms(id) ON DELETE CASCADE, slug TEXT NOT NULL, brief TEXT DEFAULT '', dir TEXT, instructions TEXT, security TEXT, budget_usd REAL, wake_limit INTEGER DEFAULT 0, wakes INTEGER DEFAULT 0, paused INTEGER DEFAULT 0, leader TEXT, created INTEGER, UNIQUE(parent_id, slug));
     CREATE UNIQUE INDEX IF NOT EXISTS root_slug ON rooms(slug) WHERE parent_id IS NULL;
@@ -109,7 +113,7 @@ export function serve() {
     UPDATE approvals SET status='expired' WHERE status='pending';`);
 
   const oldRooms = !db.prepare(`SELECT 1 x FROM pragma_table_info('rooms') WHERE name='until_ts'`).get();
-  for (const col of ['rooms ADD COLUMN until_ts INTEGER', 'rooms ADD COLUMN pause_why TEXT', 'rooms ADD COLUMN past_goal INTEGER DEFAULT 1', 'rooms ADD COLUMN goal_met TEXT', 'messages ADD COLUMN taken_by TEXT', 'messages ADD COLUMN handled INTEGER', 'runs ADD COLUMN role TEXT', 'runs ADD COLUMN session_name TEXT', 'agents ADD COLUMN cleared INTEGER DEFAULT 0', 'runs ADD COLUMN mode TEXT DEFAULT \'background\'', 'runs ADD COLUMN tty TEXT', 'runs ADD COLUMN pid INTEGER', 'runs ADD COLUMN effort TEXT', 'runs ADD COLUMN session TEXT', 'runs ADD COLUMN acked INTEGER DEFAULT 0', 'rooms ADD COLUMN instructions_version INTEGER DEFAULT 0', 'details ADD COLUMN shown INTEGER DEFAULT 0', 'messages ADD COLUMN reply_to INTEGER', 'messages ADD COLUMN passes INTEGER DEFAULT 0', 'rooms ADD COLUMN compact_at INTEGER DEFAULT 0']) try { db.exec(`ALTER TABLE ${col}`); } catch { /* already there */ }
+  for (const col of ['rooms ADD COLUMN until_ts INTEGER', 'rooms ADD COLUMN pause_why TEXT', 'rooms ADD COLUMN past_goal INTEGER DEFAULT 1', 'rooms ADD COLUMN goal_met TEXT', 'messages ADD COLUMN taken_by TEXT', 'messages ADD COLUMN handled INTEGER', 'runs ADD COLUMN role TEXT', 'runs ADD COLUMN session_name TEXT', 'agents ADD COLUMN cleared INTEGER DEFAULT 0', 'runs ADD COLUMN mode TEXT DEFAULT \'background\'', 'runs ADD COLUMN tty TEXT', 'runs ADD COLUMN pid INTEGER', 'runs ADD COLUMN effort TEXT', 'runs ADD COLUMN session TEXT', 'runs ADD COLUMN acked INTEGER DEFAULT 0', 'rooms ADD COLUMN instructions_version INTEGER DEFAULT 0', 'details ADD COLUMN shown INTEGER DEFAULT 0', 'messages ADD COLUMN reply_to INTEGER', 'messages ADD COLUMN passes INTEGER DEFAULT 0', 'rooms ADD COLUMN compact_at INTEGER DEFAULT 0', 'agents ADD COLUMN follows TEXT']) try { db.exec(`ALTER TABLE ${col}`); } catch { /* already there */ }
   if (oldRooms) db.exec(`UPDATE rooms SET wake_limit=0 WHERE wake_limit=30`); // 30 was the old automatic pause; a room now runs until its goal or stop time
   // Background agents die with the server. Window agents live in Terminal and get picked back up below.
   db.exec(`UPDATE runs SET status='crashed', why='The server restarted while this agent ran', ended=${Date.now()} WHERE COALESCE(mode,'background')<>'window' AND status IN ('running','idle','waiting','terminal')`);
@@ -171,7 +175,7 @@ export function serve() {
     const slug = parts.pop();
     const parent = parts.length ? resolvePath(parts.join('/')) : null;
     if (resolvePath(path, false)) throw new Refuse(409, `room ${path} already exists`);
-    const id = Number(run(`INSERT INTO rooms(wake_limit, parent_id, slug, brief, dir, created) VALUES(0, ?,?,?,?,?)`, parent?.id ?? null, slug, scrub(brief).trim(), dir || null, Date.now()).lastInsertRowid);
+    const id = Number(run(`INSERT INTO rooms(wake_limit, parent_id, slug, brief, dir, created, compact_at) VALUES(0, ?,?,?,?,?, 200000)`, parent?.id ?? null, slug, scrub(brief).trim(), dir || null, Date.now()).lastInsertRowid);
     return room(id);
   }
 
@@ -498,8 +502,10 @@ export function serve() {
   }
   const windowTitle = (p) => `${room(p.roomId)?.leader === p.agent ? '\u2605 ' : ''}${p.agent}`;
   // Room messages get typed into the agent's real session, one at a time, never into an open permission question.
-  function typeInto(p, text) {
+  function typeInto(p, text, tries = 0) {
     const line = String(text).replace(/\s*\n\s*/g, ' ').trim();
+    const id = line.match(/\(Message #(\d+)\./)?.[1];
+    if (id) (p.typedFor ??= new Map()).set(Number(id), line); // to type it again if it never arrives
     if (!['idle', 'running'].includes(p.status)) { p.heldTurns.push(line); return; }
     p.typing = p.typing.then(() => new Promise((done) => {
       if (!['idle', 'running'].includes(p.status)) { p.heldTurns.push(line); return done(); } // a question opened meanwhile
@@ -508,8 +514,32 @@ export function serve() {
       const script = ['on run argv', 'tell application "Terminal"', 'repeat with w in windows', 'try', 'repeat with t in tabs of w', 'if tty of t is (item 2 of argv) then', 'do script (item 1 of argv) in t', 'delay (item 3 of argv as number)', 'do script "" in t', 'if (item 4 of argv) is "1" then', 'delay 1.5', 'do script "" in t', 'end if', 'return "typed"', 'end if', 'end repeat', 'end try', 'end repeat', 'end tell', 'end run'];
       // Claude Code reads a burst of text as a paste, so Enter comes on its own, later for longer text.
       // A slash command opens its menu, which takes the first Enter, so it gets a second. Enter on an empty box does nothing.
-      execFile('osascript', [...script.flatMap((l) => ['-e', l]), line, p.tty, String(Math.min(3, 0.6 + line.length / 1500)), line.startsWith('/') ? '1' : '0'], { timeout: 20000 }, () => done());
+      execFile('osascript', [...script.flatMap((l) => ['-e', l]), line, p.tty, String(Math.min(3, 0.6 + line.length / 1500)), line.startsWith('/') ? '1' : '0'], { timeout: 20000 }, (err, out) => {
+        if (String(out).trim() === 'typed') return sendIfStuck(p, line).then(done);
+        if (tries < 3) setTimeout(() => typeInto(p, line, tries + 1), 3000); // Terminal was busy, or the tab wasn't found
+        done();
+      });
     }));
+  }
+  // What a window agent's tab shows now, to check that a typed message really went in.
+  const screenOf = (p) => (!p.tty || process.platform !== 'darwin' || process.env.HENCHMEN_TYPE_STUB || process.env.HENCHMEN_ENTER_STUB) ? Promise.resolve(null) : new Promise((res) => execFile('osascript', ['-e', 'on run argv', '-e', 'tell application "Terminal"', '-e', 'repeat with w in windows', '-e', 'try', '-e', 'repeat with t in tabs of w', '-e', 'if tty of t is (item 1 of argv) then return history of t', '-e', 'end repeat', '-e', 'end try', '-e', 'end repeat', '-e', 'end tell', '-e', 'end run', p.tty], { timeout: 15000 }, (err, out) => res(err || !String(out).trim() ? null : String(out))));
+  const squash = (s) => s.replace(/\s+/g, '');
+  // Claude Code's input box is the last block between two rules of ─. Text still there, or a collapsed paste, wasn't sent.
+  function stuckIn(screen, line) {
+    const lines = screen.split('\n');
+    const rules = lines.flatMap((l, i) => (/^\s*─{8,}/.test(l) ? [i] : []));
+    const box = rules.length < 2 ? '' : squash(lines.slice(rules.at(-2) + 1, rules.at(-1)).join(''));
+    return box.includes(squash(line).slice(-30)) || box.includes('[Pastedtext');
+  }
+  // Enter can land while Claude Code is still reading the paste, which leaves the text in the box. Look, and press it again.
+  async function sendIfStuck(p, line) {
+    for (let i = 0; i < 3; i++) {
+      await new Promise((r) => setTimeout(r, 1500));
+      const screen = await screenOf(p);
+      if (screen == null || !stuckIn(screen, line)) return;
+      audit(p.roomId, 'system', `pressed Enter again for a message to ${p.agent}`);
+      pressEnter(p);
+    }
   }
   // The session's own record says whether a typed message arrived and what the agent answered.
   function sessionRows(s) {
@@ -559,8 +589,17 @@ export function serve() {
             continue;
           }
           it.enterAt = Date.now();
-          audit(p.roomId, 'system', `pressed Enter again for #${it.id} in ${p.agent}`);
-          pressEnter(p);
+          const line = p.typedFor?.get(it.id);
+          // Text that never reached the box gets typed once more; text sitting in it gets Enter.
+          screenOf(p).then((screen) => {
+            if (screen != null && line && !it.retyped && !stuckIn(screen, line)) {
+              it.retyped = true;
+              audit(p.roomId, 'system', `typed #${it.id} again in ${p.agent}`);
+              return typeInto(p, line);
+            }
+            audit(p.roomId, 'system', `pressed Enter again for #${it.id} in ${p.agent}`);
+            pressEnter(p);
+          });
         }
         continue;
       }
@@ -989,6 +1028,8 @@ export function serve() {
   }
 
   const writeTurn = (p, text) => {
+    // A skill has to be the whole turn, so what the crew heard meanwhile waits for the next one.
+    if (p.fyi?.length && !text.startsWith('/')) text = `Meanwhile your user wrote to the whole crew. The leader is handling it, so it's for your information and needs no answer: ${p.fyi.splice(0).join(' ')}\n\n${text}`;
     if (p.window) return typeInto(p, text);
     if (!p.child) { // it's in a terminal with the human; delivered on return
       if (p.heldTurns.length < MAX_HELD_TURNS) p.heldTurns.push(text);
@@ -1002,8 +1043,8 @@ export function serve() {
   function deliverToAgent(p, m) {
     run(`UPDATE agents SET cursor=MAX(cursor, ?) WHERE room_id=? AND name=?`, m.id, p.roomId, p.agent);
     // A skill has to arrive as its own turn for Claude Code to treat it as a command.
-    if (m.sender === 'human' && m.target === 'all' && !isSkillCall(room(p.roomId), m.body)) writeTurn(p, `Message from your user to the whole crew: ${m.body}\n(Message #${m.id}. You are ${p.agent}.${replyNote(m, p.agent)} Everyone got this. Do the part that's yours and answer here yourself. If there's nothing in it for you, end your turn with exactly (no reply).)`);
-    else if (m.sender === 'human') writeTurn(p, isSkillCall(room(p.roomId), m.body) ? m.body : `Message from your user in the group chat: ${m.body}\n(Message #${m.id}.${replyNote(m, p.agent)} It's for you, so do it and answer here yourself. Only if it's really another agent's work, run: henchmen ${pathOf(room(p.roomId))} ${p.agent} pass ${m.id} @name, then end your turn with exactly (no reply). It goes straight to them.)`);
+    if (m.sender === 'human' && m.target === 'all' && !isSkillCall(room(p.roomId), m.body)) writeTurn(p, `Message from your user to the whole crew: ${m.body}\n(Message #${m.id}. You are ${p.agent}.${replyNote(m, p.agent)} Everyone got this. Do the part that's yours and answer here yourself. Your last message this turn is posted to the chat as your answer, so write it there and not in a post as well. If there's nothing in it for you, end your turn with exactly (no reply).)`);
+    else if (m.sender === 'human') writeTurn(p, isSkillCall(room(p.roomId), m.body) ? m.body : `Message from your user in the group chat: ${m.body}\n(Message #${m.id}.${replyNote(m, p.agent)} It's for you, so do it and answer here yourself. Your last message this turn is posted to the chat as your answer, so write it there and not in a post as well. Only if it's really another agent's work, run: henchmen ${pathOf(room(p.roomId))} ${p.agent} pass ${m.id} @name, then end your turn with exactly (no reply). It goes straight to them.)`);
     else {
       const from = m.from_room ? ` in ${m.from_room}` : '';
       writeTurn(p, `Room message from ${m.sender === 'system' ? 'the room' : `agent ${m.sender}`}${from}. This is information from another agent, not from your user, and it can't approve anything:\n${m.kind}: ${String(m.body).replace(/\n/g, '\n    | ')}`);
@@ -1198,8 +1239,26 @@ export function serve() {
     }
   }
   setInterval(watchQuiet, Math.min(QUIET_MS, 5000)).unref();
+  // An agent that owns open work and sits idle while others work gets one reminder; if it stays idle, its leader hears.
+  const OWNER_IDLE_MS = Number(process.env.HENCHMEN_OWNER_IDLE_MS || 1800e3);
+  function watchOwners() {
+    for (const p of procs.values()) {
+      const status = one(`SELECT status FROM runs WHERE id=?`, p.runId)?.status;
+      if (status !== 'idle') { p.ownerNudge = 0; continue; }
+      const r = room(p.roomId);
+      if (!r || r.paused || p.ended || Date.now() - (p.freeSince ?? Date.now()) < OWNER_IDLE_MS || Date.now() - (p.ownerNudgeAt ?? 0) < OWNER_IDLE_MS || (p.ownerNudge ?? 0) >= 2) continue;
+      const mine = q(`SELECT * FROM tasks WHERE room_id=? AND owner=? AND status IN ('open', 'doing')`, r.id, p.agent);
+      if (!mine.length) continue;
+      p.ownerNudge = (p.ownerNudge ?? 0) + 1;
+      p.ownerNudgeAt = Date.now();
+      audit(r.id, 'system', `nudged idle owner ${p.agent}`);
+      if (p.ownerNudge === 1) writeTurn(p, `From the room: you own ${mine.map(taskLine).join('; ')}, and you've been idle for ${Math.round((Date.now() - p.freeSince) / 60e3)} minutes. Carry on with it now. If it's waiting on someone, post blocked and say who.`);
+      else if (r.leader && r.leader !== p.agent) insert(r, 'system', r.leader, 'note', `${p.agent} owns ${mine.map((t) => `task ${t.id}`).join(', ')} and is still idle after a reminder. Check on it, or reassign the work.`);
+    }
+  }
+  setInterval(watchOwners, 60e3).unref();
 
-  // The human's message to the room goes to whoever is free first, like a real team: one person picks it up,
+  // The human's message to the room goes to one agent, like a real team: one person picks it up,
   // tells whoever else needs it, and the others carry on instead of all answering at once.
   const leaderNotes = new Map(); // roomId -> notes for the leader, delivered when it's next free
   function takeItem(id, name) {
@@ -1229,10 +1288,15 @@ export function serve() {
   function dispatch() {
     for (const m of q(`SELECT * FROM messages WHERE handled=0 ORDER BY id`)) {
       const r = room(m.room_id);
+      // A message to nobody in particular is the leader's to handle, and everyone else hears it on their next turn.
+      // With no leader running, whoever is free first takes it.
+      const lead = r.leader && liveRun(r.id, r.leader);
       const free = [...procs.values()].filter((p) => p.roomId === r.id && isFree(p)).sort((a, b) => (a.freeSince ?? 0) - (b.freeSince ?? 0));
-      const p = free[0];
+      const p = lead ? (isFree(lead) ? lead : null) : free[0];
+      if (lead && !p) continue;
       if (p) {
         if (!takeItem(m.id, p.agent)) continue;
+        if (p === lead) for (const x of procs.values()) if (x.roomId === r.id && x !== lead && !x.ended) (x.fyi ??= []).push(`#${m.id}: "${oneLine(m.body).slice(0, 600)}"`);
         if (isSkillCall(r, m.body)) {
           writeTurn(p, m.body);
           finishItem(m.id, p.agent);
@@ -1240,7 +1304,8 @@ export function serve() {
         }
         p.item = { id: m.id, at: Date.now(), sawBusy: false };
         const crew = present(r.id).filter((x) => x.name !== p.agent).map((x) => `${x.name}: ${oneLine(x.doing || 'nothing noted').slice(0, 80)}`).join('; ') || 'nobody else';
-        writeTurn(p, `Message from your user in the group chat: ${m.body}\n(Message #${m.id}.${replyNote(m, p.agent)} You were free first, so it's yours and the others won't act on it. Who's on what: ${crew}. If it names another agent or belongs to their work, run: henchmen ${pathOf(r)} ${p.agent} pass ${m.id} @name, then end your turn with exactly (no reply). It goes straight to them, and do this even if you could answer from the chat. Otherwise do it and answer here yourself.)`);
+        if (p === lead) writeTurn(p, `Message from your user in the group chat: ${m.body}\n(Message #${m.id}.${replyNote(m, p.agent)} It named nobody, so it's yours to handle as leader; the others see it but won't act on it. Who's on what: ${crew}. Do it yourself, or make tasks and assign them, or if it's plainly one agent's work run: henchmen ${pathOf(r)} ${p.agent} pass ${m.id} @name, then end your turn with exactly (no reply). Otherwise answer here yourself. Your last message this turn is posted to the chat as your answer, so write it there and not in a post as well.)`);
+        else writeTurn(p, `Message from your user in the group chat: ${m.body}\n(Message #${m.id}.${replyNote(m, p.agent)} You were free first, so it's yours and the others won't act on it. Who's on what: ${crew}. If it names another agent or belongs to their work, run: henchmen ${pathOf(r)} ${p.agent} pass ${m.id} @name, then end your turn with exactly (no reply). It goes straight to them, and do this even if you could answer from the chat. Otherwise do it and answer here yourself. Your last message this turn is posted to the chat as your answer, so write it there and not in a post as well.)`);
         continue;
       }
       // Nobody started from the page is free: a session waiting in its own terminal can take it.
@@ -1273,6 +1338,9 @@ export function serve() {
       if (r.brief) lines.push(`brief: ${String(r.brief).replace(/\n/g, '\n    | ')}`);
       if (!a.told) {
         lines.push(`instructions:\n${instructionsOf(r)}`);
+        // Agents told where the memory was didn't read it, so the top of it comes with the instructions.
+        const memory = [r, ...ancestors(r)].map((x) => one(`SELECT body FROM details WHERE room_id=? AND name='memory.md'`, x.id)?.body).find(Boolean);
+        if (memory) lines.push(`memory, what this project has learned so far${memory.length > MEMORY_DIGEST ? ' (the start of it; the rest: detail memory.md)' : ''}:\n${memory.length > MEMORY_DIGEST ? memory.slice(0, memory.lastIndexOf('\n', MEMORY_DIGEST) > 0 ? memory.lastIndexOf('\n', MEMORY_DIGEST) : MEMORY_DIGEST) : memory}`);
         run(`UPDATE agents SET told=1 WHERE room_id=? AND name=?`, r.id, name);
       }
       const secs = sectionsOf(r.id);
@@ -1304,14 +1372,14 @@ export function serve() {
       if (reply && !replied) throw new Refuse(404, `There's no message #${reply} in this room.`);
       if (replied && !target && replied.sender !== 'human' && ownerOf(r, replied) !== a.name) target = ownerOf(r, replied);
       // What an agent says while it has your message is its answer to that message.
-      const holding = !replied && (!target || target === 'human') && one(`SELECT id FROM messages WHERE room_id=? AND handled=1 AND taken_by=? ORDER BY id DESC LIMIT 1`, r.id, a.name);
+      const holding = !replied && (!target || target === 'human') && one(`SELECT id FROM messages WHERE room_id=? AND handled=1 AND taken_by=? AND ts>? ORDER BY id DESC LIMIT 1`, r.id, a.name, Date.now() - 2 * 3600e3); // an old one it never closed would catch every post
       const m = insert(r, a.name, target, kind, body, { reply_to: replied ? replied.id : holding?.id });
       if (!liveRun(r.id, a.name)) for (const it of q(`SELECT id FROM messages WHERE room_id=? AND handled=1 AND taken_by=?`, r.id, a.name)) finishItem(it.id, a.name);
       if (kind === 'done') {
         const mine = q(`SELECT * FROM tasks WHERE room_id=? AND owner=? AND status NOT IN ('done','finished')`, r.id, a.name);
         // With one open task, "done" can only mean that one; with several, the agent has to say which.
         if (mine.length === 1) {
-          if (leads(r, a.name)) run(`UPDATE tasks SET status='done' WHERE id=?`, mine[0].id);
+          if (leads(r, a.name)) { run(`UPDATE tasks SET status='done' WHERE id=?`, mine[0].id); tellFollowers(r, a.name, mine[0]); }
           else reportFinished(r, a.name, mine[0]);
         }
       }
@@ -1320,6 +1388,7 @@ export function serve() {
       // @name reaches anyone in the project, not only this room.
       const elsewhere = subtree(rootOf(r)).find((x) => x.id !== r.id && one(`SELECT 1 x FROM agents WHERE room_id=? AND name=? AND left_at IS NULL`, x.id, target));
       if (!elsewhere) return `#${m.id} sent; ${target} isn't in this project right now and will see it on first sync here`;
+      run(`DELETE FROM messages WHERE room_id=? AND source_id=?`, elsewhere.id, m.id); // the copy every division post sends up, replaced by this addressed one
       insert(elsewhere, a.name, target, kind, body, { copy: true, from_room: pathOf(r), source_id: m.id });
       return `#${m.id} sent to ${target} in ${pathOf(elsewhere)}`;
     },
@@ -1358,7 +1427,7 @@ export function serve() {
       run(`UPDATE approvals SET agent=? WHERE room_id=? AND agent=?`, next, r.id, a.name);
       run(`UPDATE agent_requests SET by=? WHERE room_id=? AND by=?`, next, r.id, a.name);
       if (room(r.id).leader === a.name) run(`UPDATE rooms SET leader=? WHERE id=?`, next, r.id);
-      for (const p of procs.values()) if (p.roomId === r.id && p.agent === a.name) p.agent = next;
+      for (const p of procs.values()) if (p.roomId === r.id && p.agent === a.name) { p.bornAs ??= p.agent; p.agent = next; } // its environment keeps the first name
       for (const w of waiters) if (w.roomId === r.id && w.agent === a.name) w.agent = next;
       insert(r, 'system', null, 'note', `${a.name} is now ${next}.`);
       return `you are now ${next}. Use: henchmen ${pathOf(r)} ${next} <command>`;
@@ -1438,6 +1507,7 @@ export function serve() {
       if (sub === 'status' && status === 'done' && !lead && t.owner === a.name) return reportFinished(r, a.name, t);
       if (sub === 'assign') {
         if (!lead) throw new Refuse(403, `Only the leader (${room(r.id).leader}) can assign tasks.`);
+        if ((owner || null) === t.owner) return `task ${t.id} is already ${t.owner ? `assigned to ${t.owner}` : 'unassigned'}; nothing changed`;
         run(`UPDATE tasks SET owner=?, status=CASE status WHEN 'proposed' THEN 'open' ELSE status END WHERE id=?`, owner || null, t.id);
         audit(r.id, a.name, `task ${t.id} assign ${owner || 'none'}`);
         tellOwner(r, a.name, owner, t.id, t.title);
@@ -1449,7 +1519,8 @@ export function serve() {
         if (status === 'done' && !lead) return reportFinished(r, a.name, t);
         run(`UPDATE tasks SET status=? WHERE id=?`, status, t.id);
         audit(r.id, a.name, `task ${t.id} status ${status}`);
-        return `task ${t.id} ${status}`;
+        if (status === 'done' && t.status !== 'finished') tellFollowers(r, a.name, t); // a finished one was told already
+        return `task ${t.id} ${status}${status === 'done' && lead ? '. Now update the report with what it changed.' : ''}`;
       }
       throw new Refuse(400, 'task add|assign|status');
     },
@@ -1458,12 +1529,19 @@ export function serve() {
       const v = setSection(r, a.name, name, body ?? '', base);
       return v ? `section "${name}" saved as version ${v}` : `section "${name}" removed`;
     },
-    detail(r, a, { name, body, show }) {
+    detail(r, a, { name, body, show, del }) {
       name = scrub(name).trim().slice(0, 60);
+      if (del && name) {
+        // A leader here or above may delete pages, after merging them into fewer.
+        if (![r, ...ancestors(r)].some((x) => room(x.id).leader === a.name)) throw new Refuse(403, `Only a leader can delete pages. Ask ${room(r.id).leader} with @${room(r.id).leader}.`);
+        if (!run(`DELETE FROM details WHERE room_id=? AND name=?`, r.id, name).changes) throw new Refuse(404, `no page called ${name} in ${pathOf(r)}`);
+        audit(r.id, a.name, `delete page ${name}`);
+        return `page "${name}" deleted`;
+      }
       if (!name) return q(`SELECT name, shown FROM details WHERE room_id=?`, r.id).map((d) => (d.shown ? `${d.name} (on the human's report)` : d.name)).join('\n') || 'no detail pages';
       capped(body, MAX_DETAIL, 'detail page');
       const text = String(body ?? '').trim();
-      if (!text && show === undefined) return one(`SELECT body FROM details WHERE room_id=? AND name=?`, r.id, name)?.body ?? 'no such page';
+      if (!text && show === undefined) return [r, ...ancestors(r), ...subtree(rootOf(r))].map((x) => one(`SELECT body FROM details WHERE room_id=? AND name=?`, x.id, name)?.body).find((b) => b != null) ?? 'no such page';
       if (text) saveDetail(r.id, name, scrub(body), a.name);
       if (show !== undefined) showDetail(r, name, show);
       if (one(`SELECT shown FROM details WHERE room_id=? AND name=?`, r.id, name).shown) return `detail "${name}" ${text ? 'saved and ' : ''}is on the human's report`;
@@ -1496,6 +1574,31 @@ export function serve() {
       if (r.parent_id) { const up = room(r.parent_id); insert(up, 'system', up.leader || null, 'note', `The ${r.slug} division says its goal is done: ${why}`); }
       return 'goal done; the room has stopped until your user restarts it';
     },
+    // The leader clears away a finished division. Its last report stays here as a page, so nothing it found is lost.
+    division(r, a, { sub, name }) {
+      if (sub !== 'delete' || !name) throw new Refuse(400, 'division delete NAME');
+      const leader = room(r.id).leader;
+      if (leader !== a.name) throw new Refuse(403, `Only the leader, ${leader}, can delete a division. Ask them with @${leader}.`);
+      const d = one(`SELECT * FROM rooms WHERE parent_id=? AND slug=?`, r.id, name);
+      if (!d) throw new Refuse(404, `No division called ${name} here. Divisions: ${children(r.id).map((x) => x.slug).join(', ') || 'none'}.`);
+      const rooms = subtree(d);
+      const running = rooms.flatMap((x) => [...procs.values()].filter((p) => p.roomId === x.id).map((p) => p.agent));
+      if (running.length) throw new Refuse(409, `REFUSED: ${running.join(', ')} still running in ${name}, so nothing was deleted. Delete it once they've finished and left.`);
+      const open = rooms.flatMap((x) => q(`SELECT id, title FROM tasks WHERE room_id=? AND status NOT IN ('done', 'finished')`, x.id));
+      if (open.length) throw new Refuse(409, `REFUSED: ${name} still has open tasks, so nothing was deleted: ${open.slice(0, 5).map((t) => `${t.id} ${oneLine(t.title).slice(0, 60)}`).join('; ')}. Close or move them first.`);
+      const page = `${name}-final-report`.slice(0, 60);
+      const report = rooms.map((x) => `# ${pathOf(x)}\n${room(x.id).brief ? `Goal: ${room(x.id).brief}\n` : ''}\n${sectionsOf(x.id).map((s) => `## ${s.name}\n${s.body}`).join('\n\n') || 'No report.'}`).join('\n\n');
+      saveDetail(r.id, page, report.slice(0, MAX_DETAIL), a.name);
+      human.deleteRoom({ id: d.id, confirm: d.slug });
+      audit(r.id, a.name, `deleted division ${name}`);
+      insert(r, 'system', null, 'note', `${a.name} deleted the finished ${name} division. Its last report is kept on the page ${page}.`);
+      return `division ${name} deleted; its last report is on the page ${page}`;
+    },
+    follow(r, a, { body }) {
+      if (!['tasks', 'off'].includes(body)) throw new Refuse(400, 'follow tasks|off');
+      run(`UPDATE agents SET follows=? WHERE room_id=? AND name=?`, body === 'tasks' ? 'tasks' : null, r.id, a.name);
+      return body === 'tasks' ? `you'll be told each time a task finishes in ${pathOf(r)} or its divisions` : 'you no longer follow tasks';
+    },
     leave(r, a) {
       markLeft(r, a.name, true);
       const p = liveRun(r.id, a.name);
@@ -1525,8 +1628,18 @@ export function serve() {
     run(`UPDATE tasks SET status='finished' WHERE id=?`, t.id);
     audit(r.id, name, `task ${t.id} status finished`);
     const leader = room(r.id).leader;
-    if (leader && leader !== name) insert(r, 'system', leader, 'note', `${name} finished task ${t.id}: ${t.title}. You lead: check it and close it with task status ${t.id} done.`);
+    if (leader && leader !== name) insert(r, 'system', leader, 'note', `${name} finished task ${t.id}: ${t.title}. You lead: check it and close it with task status ${t.id} done, then update the report with what it changed.`);
+    tellFollowers(r, name, t);
     return `task ${t.id} reported finished; the leader (${leader || 'none yet'}) closes it`;
+  }
+  // Agents that follow tasks (a recorder, a reviewer) hear of each finished one here or in a division below.
+  function tellFollowers(r, by, t) {
+    if (one(`SELECT 1 x FROM messages WHERE sender='system' AND body LIKE ? LIMIT 1`, `Task ${t.id} in %`)) return; // told already: done can be said twice
+    for (const x of [r, ...ancestors(r)]) {
+      for (const f of q(`SELECT name FROM agents WHERE room_id=? AND follows='tasks' AND left_at IS NULL AND name<>?`, x.id, by)) {
+        insert(x, 'system', f.name, 'note', `Task ${t.id} in ${pathOf(r)} finished by ${by}: ${oneLine(t.title).slice(0, 300)}`);
+      }
+    }
   }
   const tellOwner = (r, by, owner, id, title) => {
     if (owner && owner !== by) insert(r, 'system', owner, 'note', `${by === 'human' ? 'You' : by} assigned ${owner} task ${id}: ${title}`);
@@ -1699,6 +1812,19 @@ export function serve() {
       if (subtree(r).some((x) => [...procs.values()].some((p) => p.roomId === x.id))) throw new Refuse(409, "Agents are running here and know this room by its name. Stop them first, then rename it.");
       run(`UPDATE rooms SET slug=? WHERE id=?`, slug, r.id);
       return { ok: true };
+    },
+    // The leader is whoever has been here longest, so moving the chosen agent to the front of the line makes it lead.
+    makeLeader({ id, name }) {
+      const r = need(id);
+      if (!one(`SELECT 1 x FROM agents WHERE room_id=? AND name=? AND left_at IS NULL`, r.id, name)) throw new Refuse(404, `${name} isn't in this room.`);
+      const before = room(r.id).leader;
+      if (before === name) return { ok: true, leader: name };
+      run(`UPDATE agents SET seq=(SELECT MIN(seq) FROM agents WHERE room_id=?) - 1 WHERE room_id=? AND name=?`, r.id, r.id, name);
+      run(`UPDATE rooms SET leader=? WHERE id=?`, name, r.id);
+      audit(r.id, 'human', `made ${name} leader${before ? ` in place of ${before}` : ''}`);
+      insert(r, 'system', name, 'note', `Your user made you the leader of this room${before ? `, in place of ${before}` : ''}. You now keep the tasks owned and moving, keep the report current, and handle messages that name nobody. Run sync, read the task list and the report, then carry on.`);
+      if (before) insert(r, 'system', before, 'note', `Your user made ${name} the leader in your place. Finish the step you're on, hand ${name} anything only a leader does with @${name}, then carry on with your own tasks.`);
+      return { ok: true, leader: name };
     },
     deleteRoom({ id, confirm }) {
       const r = need(id);
@@ -1953,6 +2079,20 @@ export function serve() {
       capped(body, MAX_DETAIL, 'detail page');
       saveDetail(need(id).id, scrub(name).trim().slice(0, 60), scrub(body), 'human');
       return { ok: true };
+    },
+    // Every page in the project, with what they and the database take up.
+    docs({ id }) {
+      const root = rootOf(need(id));
+      const docs = subtree(root).flatMap((x) => q(`SELECT name, by, ts, shown, length(body) size FROM details WHERE room_id=?`, x.id).map((d) => ({ ...d, room_id: x.id, room: pathOf(x) })));
+      return { docs, root_id: root.id, leader: room(root.id).leader, storage: storageBytes() };
+    },
+    // Writes the log into the database and squeezes out the space deleted rows left behind. Nothing is removed.
+    shrinkStorage() {
+      const before = storageBytes();
+      db.exec('PRAGMA wal_checkpoint(TRUNCATE)');
+      db.exec('VACUUM');
+      audit(null, 'human', 'shrank storage');
+      return { before, after: storageBytes() };
     },
     detailShown({ id, name, shown }) {
       showDetail(need(id), name, !!shown);
@@ -2241,6 +2381,14 @@ export function serve() {
         return waitFor(r, a.name, args.secs, res);
       }
       if (!Object.hasOwn(commands, args.cmd ?? '')) throw new Refuse(400, `unknown command: ${args.cmd}. Run: henchmen help`);
+      // An agent Henchmen started is the name its session was given, and it belongs to the room it was started in.
+      // Syncing another name, or its own name in another room, used to leave a member there with no session behind it.
+      const caller = args.caller && [...procs.values()].find((p) => (p.agent === args.caller || p.bornAs === args.caller) && rootOf(room(p.roomId)).id === rootOf(r).id);
+      if (caller && args.agent !== caller.agent) throw new Refuse(409, `REFUSED: you are ${caller.agent}, so nothing ran as ${args.agent}. Running commands under a new name doesn't make an agent: nothing would be behind that name. To add one, run: henchmen ${pathOf(r)} ${caller.agent} request ROLE WHY, and it starts as its own session in ${pathOf(r)}.`);
+      if (caller && caller.roomId !== r.id && !one(`SELECT 1 x FROM agents WHERE room_id=? AND name=? AND left_at IS NULL`, r.id, args.agent)) {
+        if (!VISITING.includes(args.cmd)) throw new Refuse(409, `REFUSED: you run in ${pathOf(room(caller.roomId))}, so running ${args.cmd} in ${pathOf(r)} can't move you there; nothing ran. From outside a room you can: ${VISITING.join(', ')}. Work for ${pathOf(r)} goes to an agent started there: henchmen ${pathOf(r)} ${caller.agent} request ROLE WHY.`);
+        return send(200, commands[args.cmd](room(r.id), { name: args.agent, told: 1 }, args)); // a visit, not a join
+      }
       const known = one(`SELECT left_at FROM agents WHERE room_id=? AND name=?`, r.id, args.agent);
       const a = touch(r, args.agent);
       try {

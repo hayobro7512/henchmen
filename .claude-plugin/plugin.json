@@ -1,7 +1,7 @@
 {
   "name": "henchmen",
   "displayName": "Henchmen",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "description": "Run a crew of Claude agents on one large project from one local page: terminal windows on your plan, a leader, a live group chat and a one-page report.",
   "author": { "name": "hayobro7512", "url": "https://github.com/hayobro7512" },
   "homepage": "https://github.com/hayobro7512/henchmen",

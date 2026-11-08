@@ -770,6 +770,7 @@ function fillPop(a) {
     if (!b.dataset.sure) { b.dataset.sure = '1'; b.textContent = a.live ? `Yes, stop and remove ${a.name}` : `Yes, remove ${a.name}`; b.classList.add('danger'); return; }
     run(b, async () => { await act('remove', { id: R.id, name: a.name }); closePop(); R.popAgent = null; toast(`Removed ${a.name}. It left a handoff in Agents' files.`); tick(); });
   } }, 'Remove from crew');
+  const lead = a.here && !a.leader && h('button', { class: 'btn', type: 'button', ...owned, title: 'It takes over the tasks, the report, and messages that name nobody', onclick: (e) => run(e.currentTarget, async () => { await act('makeLeader', { id: R.id, name: a.name }); closePop(); R.popAgent = null; toast(`${a.name} leads this room now. Both agents were told.`); tick(); }) }, `Make ${a.name} leader`);
   const details = (page || win) && R.owner && h('button', { class: 'btn', type: 'button', onclick: () => { closePop(); R.popAgent = null; openAgent(a.name); } }, 'Subagents and steps');
   if (stop) stop.addEventListener('click', () => run(stop, async () => { await act('stop', { id: R.id, name: a.name }); closePop(); R.popAgent = null; toast(`Stopped ${a.name}. It left a handoff in Agents' files.`); tick(); }));
   // This redraws while open, so the button in use keeps focus.
@@ -780,7 +781,7 @@ function fillPop(a) {
     ...(inTerminal ? [h('p', { class: 'pop-note' }, "It's in a full terminal session with you. Messages sent now are held and delivered when it returns.")] : []),
     ...(win && a.live ? [h('p', { class: 'pop-note' }, "Runs in its own terminal window on your plan. Room messages are typed into it; they wait while it's asking you something.")] : []),
     ...(a.here && a.source === 'terminal' ? [h('p', { class: 'pop-note' }, "It runs in a terminal Henchmen didn't open, or it's a name left behind with no session. If it's not really there, remove it.")] : []),
-    h('div', { class: 'pop-actions' }, details, message, talk, interrupt, stop, remove),
+    h('div', { class: 'pop-actions' }, details, message, talk, interrupt, lead, stop, remove),
     ...(command ? [commandBox(command)] : []));
   if (focused) [...E.pop.querySelectorAll('button')].find((b) => b.textContent === focused)?.focus();
   if (popEl === E.pop) E.pop.style.top = `${Math.max(12, Math.min(parseFloat(E.pop.style.top), innerHeight - E.pop.offsetHeight - 12))}px`;
@@ -1219,7 +1220,53 @@ function openAddSection() {
   }, name, h('div', { class: 'editor' }, ta), err, h('div', { class: 'row' }, save, h('button', { class: 'btn', type: 'button', onclick: () => E.addSlot.replaceChildren() }, 'Cancel'))));
   name.focus();
 }
-function openDetail(name) {
+// Every page in the project in one list, and two ways to make them take less room: shrink Henchmen's storage,
+// or have the leader condense the long pages. Deleting can't be undone, so the first click only asks.
+const sizeText = (n) => (n < 1e6 ? `${Math.max(1, Math.round(n / 1000))} KB` : `${(n / 1e6).toFixed(1)} MB`);
+function openDocs() {
+  openDialog({
+    title: 'Documents', cls: 'center',
+    build: (body, d) => {
+      const err = h('p', { class: 'err', role: 'alert' });
+      const said = h('p', { class: 'hint', role: 'status' });
+      let data;
+      const load = async () => { data = await act('docs', { id: R.id }); draw(); };
+      const shrink = h('button', { class: 'btn', type: 'button', disabled: !R.owner, title: 'Writes pending changes into the database and frees the space deleted messages and pages left. Nothing is removed.', onclick: () => run(shrink, async () => {
+        const { before, after } = await act('shrinkStorage', {});
+        said.textContent = `Henchmen's storage went from ${sizeText(before)} to ${sizeText(after)}. Nothing was removed.`;
+        await load();
+      }, err) }, 'Free up space');
+      const ask = h('button', { class: 'btn', type: 'button', disabled: !R.owner, onclick: () => run(ask, async () => {
+        const big = data.docs.filter((x) => x.size > 5000 && x.name !== 'memory.md').sort((a, b) => b.size - a.size).slice(0, 30);
+        if (!big.length) { said.textContent = 'No page is over 5,000 characters, so there is nothing to compact.'; return; }
+        await act('say', { id: data.root_id, target: data.leader, body: `Compact the project's pages so they take less space and less reading. These are over 5,000 characters: ${big.map((x) => `${x.name} in ${x.room} (${x.size.toLocaleString()} characters)`).join('; ')}. Rewrite each one shorter in place, with detail NAME < FILE run in that page's room. Keep results with their numbers, decisions, what failed and why, and where things live; cut logs, repeated text and step-by-step narration. Merge the handoff pages of agents who are gone into one page called Handoffs (archived), then delete each merged page with: detail NAME --delete. Leave memory.md to the recorder. Tell me in one line how much smaller they are.` });
+        said.textContent = `Asked ${data.leader} to compact ${big.length === 1 ? '1 page' : `${big.length} pages`}.`;
+        tick();
+      }, err) }, 'Ask the leader to compact pages');
+      const draw = () => {
+        const total = data.docs.reduce((n, x) => n + x.size, 0);
+        ask.disabled = !R.owner || !data.leader;
+        const rooms = [...new Set(data.docs.map((x) => x.room))];
+        body.replaceChildren(
+          h('p', {}, `${data.docs.length === 1 ? '1 page' : `${data.docs.length} pages`} in this project, ${sizeText(total)} of text. Henchmen's storage on this computer: ${sizeText(data.storage)}.`),
+          h('div', { class: 'row' }, shrink, ask), said, err,
+          ...rooms.map((room) => h('div', { class: 'dlg-group' }, h('h3', {}, room),
+            h('ul', { class: 'file-list' }, data.docs.filter((x) => x.room === room).sort((a, b) => b.size - a.size).map((x) => {
+              const del = h('button', { class: 'btn', type: 'button', disabled: !R.owner, onclick: () => {
+                if (!del.dataset.sure) { del.dataset.sure = '1'; del.textContent = 'Yes, delete'; del.classList.add('danger'); return; }
+                run(del, async () => { await act('deleteDetails', { id: x.room_id, name: x.name }); await load(); tick(); }, err);
+              } }, 'Delete');
+              return h('li', {},
+                h('button', { class: 'text-btn', type: 'button', onclick: () => { d.close(); openDetail(x.name, x.room_id); } }, x.name),
+                h('span', { class: 'hint' }, `${sizeText(x.size)}, ${x.shown ? 'on the report' : "agents' file"}, ${x.by === 'human' ? 'you' : x.by}, ${ago(x.ts)}`), del);
+            })))));
+      };
+      body.replaceChildren(h('p', {}, 'Loading'));
+      load().catch(() => body.replaceChildren(h('p', {}, "Couldn't load the documents. Check that Henchmen is running.")));
+    },
+  });
+}
+function openDetail(name, roomId = R.id) {
   openDialog({
     title: name, cls: 'sheet',
     build: (body, dlg) => {
@@ -1228,14 +1275,14 @@ function openDetail(name) {
       const err = h('p', { class: 'err', role: 'alert' });
       const flip = h('button', { class: 'btn', type: 'button', hidden: true, disabled: !R.owner });
       body.append(box, meta, err, h('div', { class: 'row' }, flip));
-      getJSON(`/api/room/${R.id}/detail?name=${encodeURIComponent(name)}`).then((d) => {
+      getJSON(`/api/room/${roomId}/detail?name=${encodeURIComponent(name)}`).then((d) => {
         if (d.body == null) { box.textContent = "This page isn't there anymore."; return; }
         box.innerHTML = markdown(d.body);
         meta.textContent = `Updated ${ago(d.ts)} by ${d.by === 'human' ? 'you' : d.by}`;
         flip.hidden = false;
         flip.textContent = d.shown ? "Move to Agents' files" : 'Put on the report';
         flip.onclick = () => run(flip, async () => {
-          await act('detailShown', { id: R.id, name, shown: !d.shown });
+          await act('detailShown', { id: roomId, name, shown: !d.shown });
           dlg.close();
           toast(d.shown ? `Moved ${name} to Agents' files.` : `Put ${name} on the report.`);
           tick();
@@ -1250,7 +1297,7 @@ function buildComposer() {
   const E = R.el;
   E.input = h('textarea', {
     rows: 1, 'aria-label': 'Message', disabled: !R.owner,
-    placeholder: R.owner ? `Tell your crew what to do. @name picks one, /skill runs a skill.${Speech ? ' Hold Space to talk.' : ''}` : VIEW_ONLY,
+    placeholder: R.owner ? hints()[0] : VIEW_ONLY,
     oninput: sizeInput,
     onkeydown: composerKeys,
     onkeyup: (e) => { if (e.key === ' ' && voice.held) stopVoice(); },
@@ -1263,8 +1310,22 @@ function buildComposer() {
   E.sendBtn = h('button', { class: 'btn primary', type: 'submit', disabled: !R.owner }, 'Send');
   E.typing = h('div', { class: 'typing', 'aria-live': 'polite' });
   E.replyBar = h('div', { class: 'reply-bar', hidden: true });
+  if (R.owner) new ResizeObserver(() => fitHint(E.input)).observe(E.input);
   return h('form', { class: 'composer', onsubmit: (e) => { e.preventDefault(); send(); } }, E.menu.el, E.typing, E.replyBar,
     h('div', { class: 'composer-row' }, E.input, E.micBtn || null, E.sendBtn), E.sendErr);
+}
+// The box's hint, longest first; it shows the longest one that fits on one line.
+const hints = () => Speech
+  ? ['Tell your crew what to do. @name picks one, /skill runs a skill, hold Space to talk.', '@name picks one, /skill runs a skill, hold Space to talk', '@name, /skill, hold Space to talk', '@name, /skill, Space to talk', '@name, /skill, Space']
+  : ['Tell your crew what to do. @name picks one, /skill runs a skill.', '@name picks one, /skill runs a skill', '@name, /skill'];
+const measure = document.createElement('canvas').getContext('2d');
+function fitHint(el) {
+  const cs = getComputedStyle(el);
+  const room = el.clientWidth - parseFloat(cs.paddingLeft) - parseFloat(cs.paddingRight) - 4;
+  if (room <= 0) return;
+  measure.font = `${cs.fontStyle} ${cs.fontWeight} ${cs.fontSize} ${cs.fontFamily}`;
+  const all = hints();
+  el.placeholder = all.find((t) => measure.measureText(t).width <= room) ?? all.at(-1);
 }
 // Esc for one agent, with what it should do instead.
 function openInterrupt(name) {
@@ -1357,7 +1418,7 @@ function openActions() {
         tick();
       }, err);
       const limit = h('select', { 'aria-label': 'Compact automatically', disabled: !R.owner, onchange: () => run(null, () => act('compactAt', { id: R.id, tokens: Number(limit.value) }), err) },
-        h('option', { value: '0' }, 'Let Claude Code decide'), ...[150, 250, 400].map((k) => h('option', { value: String(k * 1000) }, `When a resting agent passes ${k}k tokens`)), h('option', { value: '-1' }, 'Off'));
+        h('option', { value: '0' }, 'Let Claude Code decide'), ...[150, 200, 250, 400].map((k) => h('option', { value: String(k * 1000) }, `When a resting agent passes ${k}k tokens`)), h('option', { value: '-1' }, 'Off'));
       limit.value = String(v.compact_at || 0);
       const limitHint = h('span', { class: 'hint' });
       const explain = () => { limitHint.textContent = { 0: 'Claude Code compacts an agent on its own when its memory is nearly full.', '-1': "Nothing compacts on its own, not even Claude Code, so once an agent's memory is full its turns fail until you press Compact. Applies to agents started after you pick it." }[limit.value] ?? 'Henchmen compacts a resting agent past this size. Claude Code still compacts one that gets nearly full.'; };
@@ -1365,6 +1426,7 @@ function openActions() {
       limit.addEventListener('change', explain);
       body.append(
         h('div', { class: 'dlg-group' }, h('h3', {}, 'Find in chat'), search, note, results),
+        h('div', { class: 'dlg-group' }, h('h3', {}, 'Documents'), h('span', { class: 'hint' }, 'Every page in this project and its divisions: report pages, handoffs and agents\' files. Read, delete, or make them take less room.'), h('div', { class: 'row' }, h('button', { class: 'btn', type: 'button', onclick: () => { d.close(); openDocs(); } }, 'Open documents'))),
         h('div', { class: 'dlg-group' }, h('h3', {}, 'Catch me up'), h('span', { class: 'hint' }, 'Sends the leader a message asking what changed since you last looked.'), h('div', { class: 'row' }, catchUp)),
         h('div', { class: 'dlg-group' }, h('h3', {}, 'Agent memory'),
           h('span', { class: 'hint' }, 'What each agent re-reads on every turn. Compacting replaces it with a summary, so turns cost less but some detail is lost. Your chat stays as it is.'),

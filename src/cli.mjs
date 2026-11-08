@@ -1,7 +1,7 @@
 // The `henchmen` command. It starts the server on first use.
 import http from 'node:http';
 import { spawn, execFile } from 'node:child_process';
-import { readFileSync, mkdirSync, openSync } from 'node:fs';
+import { readFileSync, mkdirSync, openSync, fstatSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { HOME, PORT, serve } from './server.mjs';
@@ -29,10 +29,14 @@ henchmen ROOM ME task status ID open|doing|blocked|done   owner or leader
 henchmen ROOM ME report show
 henchmen ROOM ME report set SECTION [--base V] [text, or stdin]   exit 1 with STALE or REFUSED and nothing saved
 henchmen ROOM ME detail [NAME] [--show|--hide] [text, or stdin]   no text reads the page, no NAME lists pages. Pages stay off the human's report unless you --show them
+henchmen ROOM ME detail NAME --delete   leader only: delete a page, after merging it into another
 henchmen ROOM ME pass ID @NAME   give the human's message you have to the agent whose work it is; it goes straight to them, so post nothing
 henchmen ROOM ME take ID      take a message from the human that nobody has yet; the first to take it has it
 henchmen ROOM ME resolve ID   close your own blocker, question or taken message (leader: anyone's)
 henchmen ROOM ME goal done WHY  leader only: the goal is met and checked, so the room stops until the human restarts it
+henchmen ROOM ME division delete NAME   leader only: delete a finished division (no agents running, no open tasks); its last report
+                               is kept here as the page NAME-final-report
+henchmen ROOM ME follow tasks|off   be told each time a task finishes here or in a division below (for a recorder or reviewer)
 henchmen ROOM ME leave        leave and release your claims here
 henchmen ROOM ME log [n]
 henchmen ROOM ME show ID
@@ -77,8 +81,13 @@ async function callOrStart(path, args) {
 // Read as a stream: a synchronous read of a slow pipe fails with EAGAIN.
 async function stdinText() {
   if (process.stdin.isTTY) return '';
+  // A pipe or a file is read to its end. Anything else, like the socket a coding tool's shell leaves open with
+  // nothing coming, counts only if text arrives at once; otherwise a read with no text would hang forever.
+  const s = fstatSync(0);
   let text = '';
-  for await (const chunk of process.stdin) text += chunk;
+  const quiet = !(s.isFIFO() || s.isFile()) && setTimeout(() => process.stdin.destroy(), 500);
+  try { for await (const chunk of process.stdin) { clearTimeout(quiet); text += chunk; } } catch { /* closed while quiet */ }
+  clearTimeout(quiet);
   return text;
 }
 function flag(list, name) {
@@ -209,12 +218,17 @@ async function main(argv) {
 
   const [room, agent, cmd, ...rest] = argv;
   if (!cmd) return console.log(USAGE);
-  const args = { room, agent, cmd };
+  const args = { room, agent, cmd, caller: process.env.HENCHMEN_AGENT || undefined };
   const text = async () => rest.join(' ') || await stdinText();
   if (cmd === 'post') {
     args.reply = flag(rest, '--reply');
     args.kind = rest.shift();
-    if (rest[0]?.startsWith('@')) args.target = rest.shift().slice(1);
+    if (rest[0]?.startsWith('@')) {
+      // "@name the message" in one quoted word is a tag and its text, not a name with spaces.
+      const [tag, ...more] = rest.shift().split(/\s+/);
+      args.target = tag.slice(1);
+      if (more.length) rest.unshift(more.join(' '));
+    }
     args.body = await text();
   } else if (cmd === 'request') {
     args.model = flag(rest, '--model');
@@ -228,6 +242,8 @@ async function main(argv) {
   } else if (cmd === 'wait') args.secs = rest[0];
   else if (cmd === 'log') args.n = rest[0];
   else if (cmd === 'show' || cmd === 'resolve' || cmd === 'take') args.id = rest[0];
+  else if (cmd === 'division') [args.sub, args.name] = rest;
+  else if (cmd === 'follow') args.body = rest[0];
   else if (cmd === 'pass') [args.id, args.target] = rest;
   else if (cmd === 'task') {
     args.sub = rest.shift();
@@ -247,6 +263,8 @@ async function main(argv) {
       args.body = await text();
     } else if (args.sub !== 'show') return finish({ ok: false, text: 'report show | report set SECTION [--base V] [text, or stdin]' });
   } else if (cmd === 'detail') {
+    const d = rest.indexOf('--delete');
+    if (d >= 0) { rest.splice(d, 1); args.del = true; }
     for (const [f, on] of [['--show', true], ['--hide', false]]) {
       const i = rest.indexOf(f);
       if (i >= 0) { rest.splice(i, 1); args.show = on; }

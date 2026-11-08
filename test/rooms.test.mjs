@@ -1146,7 +1146,7 @@ test('the owner token survives a restart; revoke ends it', async () => {
   assert.equal(saved.token, ownerToken);
 });
 
-test('a room message goes to the first free agent, the leader hears, and nobody repeats it', async () => {
+test('a message with no name goes to the leader, the rest hear it on their next turn, and nobody repeats it', async () => {
   br(['new', 'fr', '--dir', home]);
   const id = roomId('fr');
   await page('start', { id, name: 'lead', task: 'go', cap: 5 });
@@ -1159,17 +1159,17 @@ test('a room message goes to the first free agent, the leader hears, and nobody 
   await sleep(1500);
   assert.equal(count('Message from your user in the group chat: PICK-ME-UP'), 1); // one agent, not both
   const first = await until2(async () => { const x = await view('fr'); return x.items[0]?.handled === 2 && x; });
-  const firstTaker = first.items[0].taken_by;
-  // The next one goes to whoever has been free longest; once a non-leader takes one, the leader hears, once.
-  for (let i = 0; i < 4 && !turns().some((t) => t.text?.startsWith('For the leader')); i++) {
-    await page('say', { id, body: `ANOTHER-${i}` });
-    await sleep(1600);
-  }
-  assert.ok(turns().some((t) => t.text?.startsWith('For the leader: next took your user') && t.text.includes('ANOTHER-')));
-  assert.equal(count('Message from your user in the group chat: ANOTHER-0'), 1);
+  assert.equal(first.items[0].taken_by, 'lead'); // next was free too, but the leader handles it
+  assert.ok(turns().find((t) => t.text?.includes('PICK-ME-UP')).text.includes("it's yours to handle as leader"));
+  // next hears it with its next turn (here the leader's answer, or the message below), as information.
+  const heardIt = () => turns().filter((t) => t.text?.startsWith('Meanwhile your user wrote') && t.text.includes('PICK-ME-UP')).length;
+  await page('say', { id, body: 'NEXT-ONLY', target: 'next' });
+  await until2(() => turns().some((t) => t.text?.includes('NEXT-ONLY')));
+  assert.match(turns().find((t) => t.text?.startsWith('Meanwhile') && t.text.includes('PICK-ME-UP')).text, /^Meanwhile your user wrote to the whole crew\. The leader is handling it.*PICK-ME-UP once/);
+  assert.equal(heardIt(), 1);
   // A terminal agent looking in sees it's handled, and can't take it again.
   const seen = br(['fr', 'looker', 'sync']).out;
-  assert.match(seen, new RegExp(`\\[resolved by ${firstTaker}, nothing to do\\]: PICK-ME-UP once`));
+  assert.match(seen, /\[resolved by lead, nothing to do\]: PICK-ME-UP once/);
   const itemId = (await view('fr')).items.at(-1).id;
   assert.match(br(['fr', 'looker', 'take', String(itemId)]).out, /already has/);
   await page('stopAll', { id });
@@ -1655,6 +1655,129 @@ test('the page gets a strict content security policy', async () => {
   assert.match(r.headers.get('content-security-policy'), /script-src 'self'/);
   assert.equal((await fetch(`${origin}/..%2f..%2fetc%2fpasswd`)).status, 200); // falls back to the page, not the file
   assert.doesNotMatch(await (await fetch(`${origin}/..%2f..%2fetc%2fpasswd`)).text(), /root:/);
+});
+
+test('a follower hears each finished task, and new agents are pointed to the project memory', async () => {
+  br(['new', 'mem']); br(['new', 'mem/sub']);
+  br(['mem', 'boss', 'sync']);
+  assert.match(br(['mem', 'rec', 'follow', 'tasks']).out, /told each time a task finishes/);
+  br(['mem', 'rec', 'sync']);
+  br(['mem/sub', 'dev', 'sync']); br(['mem/sub', 'w', 'sync']);
+  const id = br(['mem/sub', 'dev', 'task', 'add', '@w', 'fix the thing']).out.match(/task (\d+)/)[1];
+  br(['mem/sub', 'w', 'task', 'status', id, 'done']);
+  assert.match(br(['mem', 'rec', 'sync']).out, new RegExp(`system>rec note: Task ${id} in mem/sub finished by w: fix the thing`));
+  br(['mem', 'rec', 'detail', 'memory.md', 'MEMORY-ENTRY: the thing was fixed']);
+  const first = br(['mem/sub', 'newbie', 'sync']).out;
+  assert.match(first, /memory, what this project has learned so far:\nMEMORY-ENTRY: the thing was fixed/); // the memory itself, not a pointer
+  assert.match(br(['mem/sub', 'newbie', 'detail', 'memory.md']).out, /MEMORY-ENTRY/); // a division reads the project's page
+  assert.doesNotMatch(br(['mem/sub', 'newbie', 'sync']).out, /memory, what/); // once, with the instructions
+  assert.match(br(['mem', 'rec', 'follow', 'off']).out, /no longer follow/);
+});
+
+test('a crew agent acts only as itself, and works in other rooms of its project without joining them', async () => {
+  br(['new', 'vis']); br(['new', 'vis/div']);
+  const id = roomId('vis');
+  await page('start', { id, name: 'boss', task: 'go', cap: 5 });
+  await until2(async () => (await view('vis')).agents.find((a) => a.name === 'boss')?.run?.status === 'idle');
+  const as = { HENCHMEN_AGENT: 'boss' };
+  const fake = br(['vis/div', 'ghost', 'sync'], '', as);
+  assert.equal(fake.code, 1);
+  assert.match(fake.err + fake.out, /you are boss, so nothing ran as ghost[\s\S]*request ROLE WHY/);
+  const join = br(['vis/div', 'boss', 'sync'], '', as);
+  assert.equal(join.code, 1);
+  assert.match(join.err + join.out, /you run in vis, so running sync in vis\/div can't move you there/);
+  assert.equal(br(['vis/div', 'boss', 'post', 'note', 'VISIT-NOTE from above'], '', as).code, 0);
+  const div = await view('vis/div');
+  assert.ok(div.messages.some((m) => m.sender === 'boss' && m.body.includes('VISIT-NOTE')));
+  assert.ok(!div.agents.some((a) => a.name === 'boss' || a.name === 'ghost')); // nobody idle in the crew with no session
+  assert.notEqual(div.leader, 'boss');
+  assert.equal(br(['vis', 'boss', 'sync'], '', as).code, 0); // its own room works as before
+  await page('stopAll', { id });
+});
+
+test('your user can make any agent here the leader, and both agents are told', async () => {
+  br(['new', 'swap']);
+  const id = roomId('swap');
+  br(['swap', 'first', 'sync']); br(['swap', 'second', 'sync']);
+  assert.equal((await view('swap')).leader, 'first');
+  assert.equal((await page('makeLeader', { id, name: 'nobody' })).status, 404);
+  assert.equal((await page('makeLeader', { id, name: 'second' }, { 'x-henchmen-owner': 'wrong' })).status, 403);
+  assert.equal((await page('makeLeader', { id, name: 'second' })).status, 200);
+  assert.equal((await view('swap')).leader, 'second');
+  assert.match(br(['swap', 'second', 'sync']).out, /leader: second \(you\)[\s\S]*Your user made you the leader of this room, in place of first/);
+  assert.match(br(['swap', 'first', 'sync']).out, /Your user made second the leader in your place/);
+  br(['swap', 'third', 'sync']);
+  assert.equal((await view('swap')).leader, 'second'); // a newcomer doesn't take it back
+  const tid = br(['swap', 'second', 'task', 'add', 'a job']).out.match(/task (\d+)/)[1];
+  assert.match(br(['swap', 'first', 'task', 'assign', tid, '@third']).err, /Only the leader \(second\)/);
+});
+
+test('documents: every page in the project, a leader deletes merged ones, storage shrinks, and a read never hangs', async () => {
+  br(['new', 'docs']); br(['new', 'docs/kid']);
+  const id = roomId('docs');
+  br(['docs', 'lead', 'sync']); br(['docs', 'w', 'sync']); br(['docs/kid', 'k', 'sync']);
+  br(['docs', 'w', 'detail', 'notes-a', 'AAA-TEXT']); br(['docs/kid', 'k', 'detail', 'kid-page', 'BBB-TEXT']);
+  const all = (await page('docs', { id })).json();
+  assert.deepEqual(all.docs.map((x) => `${x.room}:${x.name}:${x.size}`).sort(), ['docs/kid:kid-page:8', 'docs:notes-a:8']);
+  assert.equal(all.leader, 'lead');
+  assert.ok(all.storage > 0);
+  // Read from a socket that stays open with nothing coming, as a coding tool's shell leaves it: it used to hang.
+  const srv = net.createServer().listen(0);
+  await new Promise((r) => srv.once('listening', r));
+  const sock = net.connect(srv.address().port);
+  await new Promise((r) => sock.once('connect', r));
+  const started = Date.now();
+  const read = await new Promise((resolve) => {
+    const c = spawn('node', [CLI, 'docs', 'w', 'detail', 'notes-a'], { env, stdio: [sock, 'pipe', 'pipe'] });
+    let out = '';
+    c.stdout.on('data', (d) => (out += d));
+    c.on('close', () => resolve(out));
+  });
+  sock.destroy(); srv.close();
+  assert.match(read, /AAA-TEXT/);
+  assert.ok(Date.now() - started < 5000);
+  assert.match(br(['docs', 'w', 'detail', 'notes-a', '--delete']).err, /Only a leader can delete pages/);
+  assert.match(br(['docs/kid', 'lead', 'detail', 'kid-page', '--delete']).out, /page "kid-page" deleted/); // the leader above may
+  assert.deepEqual((await page('docs', { id })).json().docs.map((x) => x.name), ['notes-a']);
+  const shrunk = (await page('shrinkStorage', {})).json();
+  assert.ok(shrunk.before > 0 && shrunk.after > 0);
+});
+
+test('one copy per post, one note per finished task, no repeat assign, and "@name text" in one word', async () => {
+  br(['new', 'once']); br(['new', 'once/sub']);
+  br(['once', 'boss', 'sync']); br(['once', 'rec', 'follow', 'tasks']);
+  br(['once/sub', 'dev', 'sync']); br(['once/sub', 'w', 'sync']);
+  br(['once/sub', 'dev', 'post', 'decision', '@boss', 'SHIP-IT now']);
+  assert.equal((await view('once')).messages.filter((m) => m.body.includes('SHIP-IT')).length, 1); // was the division copy plus the addressed one
+  const id = br(['once/sub', 'dev', 'task', 'add', '@w', 'job']).out.match(/task (\d+)/)[1];
+  assert.match(br(['once/sub', 'dev', 'task', 'assign', id, '@w']).out, /already assigned to w; nothing changed/);
+  br(['once/sub', 'w', 'post', 'done', 'job landed']);
+  br(['once/sub', 'w', 'task', 'status', id, 'done']); // done said twice
+  assert.equal((await view('once')).messages.filter((m) => m.body.startsWith(`Task ${id} in`)).length, 1);
+  assert.equal(br(['once', 'boss', 'post', 'note', '@rec MEM-CHECK please']).code, 0);
+  assert.ok((await view('once')).messages.some((m) => m.target === 'rec' && m.body === 'MEM-CHECK please'));
+});
+
+test('the leader deletes a finished division, and its last report stays behind as a page', async () => {
+  br(['new', 'big']); br(['new', 'big/ios']);
+  br(['big', 'boss', 'sync']); br(['big', 'w', 'sync']);
+  br(['big/ios', 'dev', 'sync']);
+  br(['big/ios', 'dev', 'report', 'set', 'Status', 'IOS-SHIPPED and tested']);
+  const added = br(['big/ios', 'dev', 'task', 'add', 'last bit']).out;
+  const taskId = added.match(/task (\d+)/)[1];
+  const not = br(['big', 'w', 'division', 'delete', 'ios']);
+  assert.equal(not.code, 1);
+  assert.match(not.err + not.out, /Only the leader, boss/);
+  assert.match(br(['big', 'boss', 'division', 'delete', 'nope']).err, /No division called nope here\. Divisions: ios/);
+  const open = br(['big', 'boss', 'division', 'delete', 'ios']);
+  assert.equal(open.code, 1);
+  assert.match(open.err + open.out, /still has open tasks.*last bit/);
+  assert.equal(br(['big/ios', 'a', 'sync']).code, 0); // still there
+  br(['big/ios', 'dev', 'task', 'status', taskId, 'done']);
+  assert.match(br(['big', 'boss', 'division', 'delete', 'ios']).out, /division ios deleted; its last report is on the page ios-final-report/);
+  assert.equal(br(['big/ios', 'a', 'sync']).code, 1);
+  assert.match(br(['big', 'boss', 'detail', 'ios-final-report']).out, /# big\/ios[\s\S]*## Status\nIOS-SHIPPED and tested/);
+  assert.ok((await view('big')).messages.some((m) => m.sender === 'system' && m.body.includes('boss deleted the finished ios division')));
 });
 
 test('renaming keeps a room reachable by its new path; deleting needs its name', async () => {
