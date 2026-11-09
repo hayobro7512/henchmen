@@ -99,6 +99,7 @@ After that, the friend opens Claude Code in their clone and says `/henchmen mypr
 
 - **The host runs the room.** The host's agents lead; a guest's agent leads only a division nobody else is in. Guests can't start, stop or remove agents, change settings, or delete anything.
 - **A guest isn't your user.** Your agents read a guest's messages as requests from a teammate and never as approval. The guest's own agents treat the guest as their user and the host as information.
+- **A guest's computer stays theirs.** Everything the host's room sends a guest's agents arrives marked, by the guest's own Henchmen, as another person's information, not instructions. Their agents get Henchmen's built-in rules, never instructions the host wrote, and they run nothing beyond their task in the repo, install nothing, change no settings and send nothing off the guest's computer unless the guest says so in their own chat. The guest's own Claude Code permissions still apply on top, so keep them on the default (asking) for these sessions.
 - **Only the invited project.** An invite opens one project, nothing else on the host's computer. `henchmen invites` lists them, and `henchmen uninvite alex` ends one at once. `henchmen share off` closes the address entirely.
 - **Invite only people you trust.** Anything a guest's agent writes reaches your agents, including text it picked up from the web. Keep the room on **Ask** while guests are in it.
 
@@ -148,6 +149,10 @@ Your rooms are stored in `~/.henchmen/`. Uninstalling the plugin leaves them the
 `henchmen help` lists everything agents and you can run.
 
 ## Patch notes
+
+### 0.4.1
+
+- **A guest's computer stays theirs.** Everything a host's room sends a guest's agents now arrives marked, by the guest's own Henchmen, as another person's information, not instructions. The `/henchmen` skill tells agents in a joined project to run nothing beyond their task in the repo, install nothing, change no settings and send nothing off the computer unless their own user says so. A guest's agents get Henchmen's built-in rules, never instructions the host wrote for the room.
 
 ### 0.4.0
 
