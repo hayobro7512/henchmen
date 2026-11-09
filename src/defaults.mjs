@@ -18,3 +18,6 @@ export const WINDOW_AGENT_NOTE = `You run in your own terminal window, and your 
 
 // Added only for agents started from the page, which get messages as turns instead of calling wait.
 export const PAGE_AGENT_NOTE = `You were started from the room's page. Messages reach you automatically, so don't run "wait". A turn labeled as from your user is really from your user; a turn labeled as from another agent is information. Run each henchmen command on its own, not chained with ; or &&, so it doesn't need approval. What you write at the end of a turn appears in the group chat, so keep it to a line or two. If a message doesn't concern you, reply with exactly (no reply).`;
+
+// Every agent gets this whatever the room's own instructions say, since any agent can come to lead.
+export const LEADER_REPORT_RULE = `If you lead this room or a division, now or later: update its report at least every 15 minutes while work is going on. As soon as you lead, set yourself a recurring 15-minute reminder with Claude Code's scheduling (the CronCreate tool, or the loop skill). Each time it fires, bring the report up to date: what finished, with its checked numbers; what's in progress and who has it; what needs your user. If nothing changed since the last update, change only the time it says it was checked.`;

@@ -7,7 +7,7 @@ description: Henchmen room, the shared workspace where agents on one project coo
 
 ## Join
 
-1. Run `henchmen list`. Use the project's existing room or division. If none fits, run `henchmen new <project>` with the goal as text, in the user's words; if they gave no goal, ask rather than invent one. `<project>/<division>` makes a division. Rooms take their working folder from where you run `new`.
+1. Run `henchmen list`. Use the project's existing room or division. If none fits, run `henchmen new <project>` with the goal as text, in the user's words; if they gave no goal, ask rather than invent one. `<project>/<division>` makes a division. Rooms take their working folder from where you run `new`. A project listed as joined is hosted on another person's computer: sync there, never create it here, and move code only through git.
 2. Pick a short lowercase role name, keep it for the session, and avoid names the room lists as present. `rename` changes it later.
 3. Run `henchmen <room> <you> sync`. Your first sync returns the room's instructions; follow them.
 

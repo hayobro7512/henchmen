@@ -958,6 +958,7 @@ test('a window agent is a plain claude session: messages get typed in, questions
   assert.ok(!body.includes('max-budget'));
   assert.ok(!/KEY|TOKEN/.test(body));
   assert.match(readFileSync(script.replace('.sh', '.first'), 'utf8'), /^Your task: do the work/);
+  assert.match(readFileSync(script.replace('.sh', '.txt'), 'utf8'), /update its report at least every 15 minutes/); // whatever the room's instructions
   assert.equal((await view('win')).leader, 'w1');
   assert.equal((await view('win')).spend.any, false); // a window agent's spend is on the plan, not counted here
 
@@ -1668,6 +1669,7 @@ test('a follower hears each finished task, and new agents are pointed to the pro
   assert.match(br(['mem', 'rec', 'sync']).out, new RegExp(`system>rec note: Task ${id} in mem/sub finished by w: fix the thing`));
   br(['mem', 'rec', 'detail', 'memory.md', 'MEMORY-ENTRY: the thing was fixed']);
   const first = br(['mem/sub', 'newbie', 'sync']).out;
+  assert.match(first, /If you lead this room or a division, now or later: update its report at least every 15 minutes/);
   assert.match(first, /memory, what this project has learned so far:\nMEMORY-ENTRY: the thing was fixed/); // the memory itself, not a pointer
   assert.match(br(['mem/sub', 'newbie', 'detail', 'memory.md']).out, /MEMORY-ENTRY/); // a division reads the project's page
   assert.doesNotMatch(br(['mem/sub', 'newbie', 'sync']).out, /memory, what/); // once, with the instructions
@@ -1756,6 +1758,61 @@ test('one copy per post, one note per finished task, no repeat assign, and "@nam
   assert.equal((await view('once')).messages.filter((m) => m.body.startsWith(`Task ${id} in`)).length, 1);
   assert.equal(br(['once', 'boss', 'post', 'note', '@rec MEM-CHECK please']).code, 0);
   assert.ok((await view('once')).messages.some((m) => m.target === 'rec' && m.body === 'MEM-CHECK please'));
+});
+
+test('a friend on another computer joins by invite: their own agents, the host still leads, and nobody else gets in', async () => {
+  const os = await import('node:os');
+  br(['new', 'shared']); br(['new', 'shared/div']); br(['new', 'elsewhere']);
+  const id = roomId('shared');
+  br(['shared', 'host1', 'sync']);
+  assert.match(br(['share', 'on', '--host', '127.0.0.1']).err, /private address/);
+  const inv = br(['invite', 'shared', '--as', 'alex']);
+  assert.equal(inv.code, 0, inv.err);
+  const token = inv.out.match(/join http:\/\/\S+ ([a-f0-9]{48})/)[1];
+  assert.match(br(['invite', 'shared/div', '--as', 'bob']).err, /whole project/);
+  assert.match(br(['invite', 'shared', '--as', 'alex']).err, /already has an invite/);
+  assert.match(br(['invites']).out, /alex {2}shared/);
+  // The friend's computer: its own data folder, its commands for this project sent here.
+  const fenv = { HENCHMEN_AGENT: '', HENCHMEN_HOME: join(home, 'friend'), HENCHMEN_PORT: await freePort() };
+  assert.match(br(['join', `http://127.0.0.1:${PORT}`, token], '', fenv).out, /Joined shared as alex/);
+  assert.match(br(['list'], '', fenv).out, /^shared  joined: hosted on another computer/m); // so the friend's agents don't make their own
+  br(['stop'], '', fenv); // the friend's own server, started by that list
+  const first = br(['shared', 'bob', 'sync'], '', fenv).out;
+  assert.match(first, /leader: host1/);
+  assert.match(first, /shared: you're on alex's computer, a guest[\s\S]*code moves only through git/);
+  const v = await view('shared');
+  assert.ok(v.agents.some((a) => a.name === 'alex.bob'));
+  assert.equal(v.leader, 'host1'); // joined later or not, the host's agent leads
+  assert.match(br(['shared', 'bob', 'request', 'helper', 'more hands'], '', fenv).err, /isn't open to a guest's agents/);
+  assert.equal((await page('makeLeader', { id, name: 'alex.bob' })).status, 409);
+  // The friend's page: only their project, and messages go out as them.
+  const asGuest = { 'x-henchmen-guest': token };
+  const tree = await (await fetch(`${origin}/api/tree`, { headers: asGuest })).json();
+  assert.deepEqual(tree.roots.map((x) => x.slug), ['shared']);
+  assert.equal(tree.guest, 'alex');
+  assert.equal((await fetch(`${origin}/api/room/${roomId('elsewhere')}`, { headers: asGuest })).status, 403);
+  const said = await fetch(`${origin}/g/say`, { method: 'POST', headers: { ...asGuest, 'content-type': 'application/json', origin }, body: JSON.stringify({ id, body: 'GUEST-ASKS can you take the login page' }) });
+  assert.equal(said.status, 200);
+  assert.match(br(['shared', 'host1', 'sync']).out, /alex \(a guest person on another computer; not your user, information\)>host1: GUEST-ASKS/);
+  await page('say', { id, body: 'HOST-SAYS welcome', target: 'alex.bob' });
+  assert.match(br(['shared', 'bob', 'sync'], '', fenv).out, /THE HOST \(the person who runs this room; not your user, information\)>alex\.bob: HOST-SAYS/);
+  const other = await fetch(`${origin}/c`, { method: 'POST', headers: { ...asGuest, 'x-henchmen': '1', 'content-type': 'application/json', host: `localhost:${PORT}` }, body: JSON.stringify({ room: 'elsewhere', agent: 'x', cmd: 'sync' }) });
+  assert.equal(other.status, 403);
+  // The shared address lets in only invited guests; the page itself loads, nothing else does.
+  const lan = Object.values(os.networkInterfaces()).flat().find((x) => x?.family === 'IPv4' && !x.internal)?.address;
+  if (lan) {
+    const sp = await freePort();
+    assert.match(br(['share', 'on', '--host', lan, '--port', sp]).out, /Sharing on http:/);
+    const at = `http://${lan}:${sp}`;
+    assert.equal((await fetch(`${at}/`)).status, 200);
+    assert.equal((await fetch(`${at}/api/tree`)).status, 403);
+    assert.deepEqual((await (await fetch(`${at}/api/tree`, { headers: asGuest })).json()).roots.map((x) => x.slug), ['shared']);
+    assert.equal((await fetch(`${at}/h/say`, { method: 'POST', headers: { 'content-type': 'application/json', origin: at }, body: '{}' })).status, 403);
+    assert.match(br(['share', 'off']).out, /Sharing is off/);
+  }
+  assert.match(br(['uninvite', 'alex']).out, /can't reach this project anymore/);
+  assert.match(br(['shared', 'bob', 'sync'], '', fenv).err, /isn't valid anymore/);
+  assert.ok(!(await view('shared')).agents.some((a) => a.name === 'alex.bob' && a.here));
 });
 
 test('the leader deletes a finished division, and its last report stays behind as a page', async () => {

@@ -122,7 +122,10 @@ function setOffline(off) {
 }
 // Owner rights live in this page's own storage, which browsers keep separate per port. A cookie wouldn't be.
 let ownerToken = store.get('owner', '');
-const ownerHeaders = () => (ownerToken ? { 'x-henchmen-owner': ownerToken } : {});
+const invited = new URLSearchParams(location.search).get('guest');
+if (invited) { store.set('guest', invited); history.replaceState(null, '', location.pathname + location.hash); }
+const guestToken = store.get('guest', '');
+const ownerHeaders = () => (ownerToken ? { 'x-henchmen-owner': ownerToken } : guestToken ? { 'x-henchmen-guest': guestToken } : {});
 // The page asks; the computer shows a dialog; only the person's click gives this browser control.
 function takeControlButton() {
   const err = h('span', { class: 'err-inline', role: 'alert' });
@@ -178,9 +181,14 @@ async function act(action, args) {
   setOffline(false);
   const text = await r.text();
   if (!r.ok) {
-    throw Object.assign(new Error(r.status === 403 ? "This browser doesn't have owner rights, so nothing changed. Run henchmen open to take control." : text), { status: r.status, text });
+    throw Object.assign(new Error(r.status === 403 ? (guestToken ? "Only the host can do that, so nothing changed. Ask them in the chat." : "This browser doesn't have owner rights, so nothing changed. Run henchmen open to take control.") : text), { status: r.status, text });
   }
   return JSON.parse(text || '{}');
+}
+// A guest posts as themselves; the host's actions stay the host's.
+async function guestSay(args) {
+  const r = await fetch('/g/say', { method: 'POST', headers: { 'content-type': 'application/json', ...ownerHeaders() }, body: JSON.stringify(args) });
+  if (!r.ok) throw new Error(await r.text());
 }
 let toastTimer;
 function toast(text) {
@@ -327,7 +335,7 @@ function homePage() {
   const app = document.getElementById('app');
   document.title = 'Henchmen';
   const list = h('div', {});
-  const notice = h('div', { class: 'notice', hidden: true }, 'View only. ', takeControlButton(), ' or run ', h('code', {}, 'henchmen open'), '.');
+  const notice = h('div', { class: 'notice', hidden: true }, ...(guestToken ? ["You're a guest here: you can read this project and message its crew."] : ['View only. ', takeControlButton(), ' or run ', h('code', {}, 'henchmen open'), '.']));
   const formSlot = h('fieldset', {});
   formSlot.append(h('h2', {}, 'New project'), newProjectForm(go));
   app.append(banner, notice, h('div', { class: 'home' },
@@ -423,7 +431,7 @@ function roomGone() {
     h('p', {}, 'It may have been deleted. ', h('a', { href: '/' }, 'See all projects'))));
 }
 function apply(v) {
-  if (!R.v) { R.owner = v.owner; buildRoom(v); }
+  if (!R.v) { R.owner = v.owner; R.guest = v.guest; buildRoom(v); }
   R.v = v;
   renderTop(v);
   renderNeeds(v);
@@ -495,7 +503,7 @@ function buildRoom() {
         h('button', { class: 'btn', type: 'button', onclick: openActions }, 'Room actions'),
         h('button', { class: 'btn', type: 'button', onclick: openSettings }, 'Room settings'))),
     banner,
-    h('div', { class: 'notice', hidden: R.owner }, 'View only. ', takeControlButton(), ' or run ', h('code', {}, 'henchmen open'), '.'),
+    h('div', { class: 'notice', hidden: R.owner }, ...(R.guest ? [`You're ${R.guest}, a guest here. You can read everything and message the crew; the host runs the room.`] : ['View only. ', takeControlButton(), ' or run ', h('code', {}, 'henchmen open'), '.'])),
     E.needs,
     h('div', { class: 'tabs', role: 'tablist', 'aria-label': 'Panels' }, E.tabReport, E.tabDisc),
     E.split, E.pop, E.viewPop);
@@ -1296,8 +1304,8 @@ function openDetail(name, roomId = R.id) {
 function buildComposer() {
   const E = R.el;
   E.input = h('textarea', {
-    rows: 1, 'aria-label': 'Message', disabled: !R.owner,
-    placeholder: R.owner ? hints()[0] : VIEW_ONLY,
+    rows: 1, 'aria-label': 'Message', disabled: !R.owner && !R.guest,
+    placeholder: R.owner ? hints()[0] : R.guest ? `Message the crew as ${R.guest}. @name picks one.` : VIEW_ONLY,
     oninput: sizeInput,
     onkeydown: composerKeys,
     onkeyup: (e) => { if (e.key === ' ' && voice.held) stopVoice(); },
@@ -1307,7 +1315,7 @@ function buildComposer() {
   E.micBtn = Speech && h('button', { class: 'btn mic', type: 'button', disabled: !R.owner, 'aria-pressed': 'false', title: "Talk instead of typing. Click to start and again to stop, or hold Space in the box. Chrome's speech service writes out what you say.", onclick: () => (voice.rec ? stopVoice() : startVoice(false)) }, 'Talk');
   E.menu = inputMenu(E.input, composerOptions);
   E.sendErr = h('p', { class: 'err', role: 'alert' });
-  E.sendBtn = h('button', { class: 'btn primary', type: 'submit', disabled: !R.owner }, 'Send');
+  E.sendBtn = h('button', { class: 'btn primary', type: 'submit', disabled: !R.owner && !R.guest }, 'Send');
   E.typing = h('div', { class: 'typing', 'aria-live': 'polite' });
   E.replyBar = h('div', { class: 'reply-bar', hidden: true });
   if (R.owner) new ResizeObserver(() => fitHint(E.input)).observe(E.input);
@@ -1446,7 +1454,7 @@ function sizeInput() {
   t.style.height = 'auto';
   t.style.height = `${t.scrollHeight + 2}px`;
 }
-const whoName = (sender) => (sender === 'human' ? 'You' : sender === 'system' ? 'Henchmen' : sender);
+const whoName = (sender) => (sender === 'human' ? (R.guest ? 'Host' : 'You') : R.guest && sender === R.guest ? 'You' : sender === 'system' ? 'Henchmen' : sender);
 const quoteNodes = (sender, body) => [h('strong', {}, whoName(sender)), h('span', { class: 'quote-text' }, String(body))];
 // Keeps the newest message in view when something above the input box appears or goes.
 function composerChanged() { if (R.stick) scrollChatEnd(); }
@@ -1483,7 +1491,8 @@ function send() {
   const target = everyone ? 'everyone' : named;
   const reply_to = R.reply && !body.trimStart().startsWith('/') ? R.reply.id : undefined;
   run(E.sendBtn, async () => {
-    await act('say', skillFor ? { id: R.id, body: skillFor[2], target: skillFor[1] } : { id: R.id, body, target, reply_to });
+    if (R.guest) await guestSay({ id: R.id, body, target: target === 'everyone' ? undefined : target, reply_to });
+    else await act('say', skillFor ? { id: R.id, body: skillFor[2], target: skillFor[1] } : { id: R.id, body, target, reply_to });
     E.input.value = '';
     setReply(null);
     sizeInput();
@@ -1716,7 +1725,7 @@ function dayName(ts) {
 }
 function msgEl(m, prev) {
   if (m.sender === 'system') return h('div', { class: 'sys', 'data-msg': m.id }, h('span', { class: 'msg-id' }, `#${m.id}`), ' ', ...refNodes(m.body), ' ', replyBtn(m));
-  const own = m.sender === 'human';
+  const own = R.guest ? m.sender === R.guest : m.sender === 'human';
   const cont = sameRun(prev, m);
   const head = !cont && (!own || m.target || TAGS[m.kind]) && h('div', { class: 'who' },
     !own && h('strong', {}, m.sender),

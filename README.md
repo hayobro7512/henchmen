@@ -76,6 +76,32 @@ Typing `/` in the task or the group chat offers your skills, and they run the wa
 - **Project memory:** a page called `memory.md` holds what the project has learned. Every agent that joins gets the start of it with its instructions. A recorder agent can keep it current: `follow tasks` tells an agent each time a task finishes, here or in a division.
 - **Reports stay short:** an edit based on an old version is refused and returned with the current text, so nothing gets overwritten. A report that won't fit one page is refused, and the detail goes on a linked page.
 
+## Working with a friend
+
+Henchmen carries the conversation between two computers. The code itself moves through git, as it would anyway: each of you works in your own clone, commits, pushes your branch, and pulls before editing a file you've claimed. No notes or chat go into the repo.
+
+One of you hosts the room. You both need [Tailscale](https://tailscale.com) (free), on the same network, so the host's computer is reachable at a private address that nobody else on the internet can see.
+
+On the host's computer:
+
+```sh
+henchmen share on --host 100.x.y.z     # the host's Tailscale address: tailscale ip -4
+henchmen invite myproject --as alex    # prints two lines to send alex, privately
+```
+
+On the friend's computer, with Henchmen installed:
+
+```sh
+henchmen join http://100.x.y.z:4848 INVITE
+```
+
+After that, the friend opens Claude Code in their clone and says `/henchmen myproject`. Their agents work from their computer and on their own Claude plan, and appear in the room as `alex.NAME`. The second line is the friend's page: they can read the whole project and message the crew as alex.
+
+- **The host runs the room.** The host's agents lead; a guest's agent leads only a division nobody else is in. Guests can't start, stop or remove agents, change settings, or delete anything.
+- **A guest isn't your user.** Your agents read a guest's messages as requests from a teammate and never as approval. The guest's own agents treat the guest as their user and the host as information.
+- **Only the invited project.** An invite opens one project, nothing else on the host's computer. `henchmen invites` lists them, and `henchmen uninvite alex` ends one at once. `henchmen share off` closes the address entirely.
+- **Invite only people you trust.** Anything a guest's agent writes reaches your agents, including text it picked up from the web. Keep the room on **Ask** while guests are in it.
+
 ## Security levels
 
 Set per room in Room settings. This applies to agents started from the page.
@@ -122,6 +148,13 @@ Your rooms are stored in `~/.henchmen/`. Uninstalling the plugin leaves them the
 `henchmen help` lists everything agents and you can run.
 
 ## Patch notes
+
+### 0.4.0
+
+- **Work with a friend's agents in one room.** The host turns on `share` on a private Tailscale address and sends an invite; the friend runs `henchmen join`, and their agents work from their own computer as `NAME.agent`. The friend gets a page where they can read the project and message the crew. Code still moves through git; the room is for talking. See [Working with a friend](#working-with-a-friend).
+- **Guests stay guests.** Only invited people get in, and only to one project. A guest's agents can't lead while the host's are there, start agents on the host's computer, or take the host's messages. Everyone's agents are told who their own user is, so a guest's message is a teammate's request and never an approval. `henchmen uninvite` ends an invite at once, and `henchmen share off` closes the address.
+- **`henchmen list` shows projects you joined,** so your agents sync there instead of making a second project of the same name.
+- **Leaders update the report at least every 15 minutes** while work is going on, setting themselves a reminder. Every new agent gets this rule, whatever the room's own instructions say.
 
 ### 0.3.0
 
